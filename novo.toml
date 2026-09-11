@@ -1,0 +1,48 @@
+[package]
+name        = "msgpack-nv"
+version     = "0.0.1"
+description = "MessagePack, whole: every format family including bin, ext and the timestamp extension, a value tree, an encoder into a caller's buffer, a feed-and-drain decoder for a stream that arrives in pieces, and a serde bridge so a struct writes itself.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: arithmetic over bytes the caller already holds.  No function
+# declares an effect — a wire format has nowhere to put one, and the
+# timestamp extension takes its seconds as a parameter because a `core`
+# package has no clock.
+#
+# It carries no `tests/embedded_probe.nv` and therefore makes NO device
+# claim, on purpose: the surface speaks `Bytes`, `Str` and `Result`, and
+# none of the three links at `@tier(embedded)` today.  cbor-nv is the
+# one of this pair with a device half, because the plan row says the
+# embedded tier prefers CBOR.
+layer       = "core"
+
+category    = "encoding"
+
+tags        = ["msgpack", "messagepack", "serde", "wire-format", "streaming", "sans-io"]
+repository  = "https://github.com/novolang/msgpack-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+[docs.pages]
+"README.md" = "JSON's data model in a quarter of the bytes"
+
+[dependencies]
+# None, and two of them are worth saying out loud.
+#
+# NOT leb128-nv or zigzag-nv.  MessagePack's integers are BIG-ENDIAN
+# FIXED WIDTH — one, two, four or eight bytes chosen by the format byte
+# in front of them — and not variable-length quantities at all.  The
+# two varint packages are postcard-nv's dependencies for a reason that
+# does not apply here.
+#
+# NOT serde-nv.  The `Serializer` and `Deserializer` traits this
+# package implements are the STANDARD LIBRARY's (`std.serialize`), not
+# that package's, and depending on it would put a second MessagePack
+# implementation in every consumer's assembly.

@@ -1,0 +1,451 @@
+// tests/msgpack_tests.nv — the API tests, written against the
+// signatures.
+//
+// They COMPILE today and they FAIL at run, with `not implemented:
+// mpack.<fn>` from the `todo()` that is each body.  That is the
+// expected state of an interface release: the compiler has checked
+// every signature, every type and every effect row, and nothing else
+// has been checked because there is nothing else yet.
+//
+// EVERY VECTOR IS THE SPECIFICATION'S.  The MessagePack format
+// specification (github.com/msgpack/msgpack, revision 2, 2017-08-09)
+// gives the format table, the worked examples in its "Formats" section,
+// and the timestamp extension's three widths.  A test that passes here
+// is a document `msgpack-python` reads and one it would have produced.
+
+use std.test
+use std.list
+use std.bytes
+use mpack
+use mpackdec
+use mpackserde
+
+// A payload written the way a reader can check it against the
+// specification's format table.
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+// ── The format table, one family at a time ──────────────────────────
+
+@test
+fn test_nil_and_the_booleans_are_one_byte_each()
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgNil)), "c0")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgBool(false))), "c2")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgBool(true))), "c3")
+    test.assert_eq(mpack.format_byte(MsgNil), 0xC0)
+    match mpack.decode(hex("c3"))
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            match mpack.as_bool(v)
+                Ok(on)  => test.assert_eq(on, true)
+                Err(e2) => test.fail(e2.message())
+
+@test
+fn test_an_integer_takes_the_shortest_format_that_holds_it()
+    // Positive fixint is 0x00..0x7f, negative fixint is 0xe0..0xff, and
+    // everything outside those needs a format byte in front.
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgInt(0))), "00")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgInt(127))), "7f")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgInt(128))), "cc80")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgInt(0 - 1))), "ff")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgInt(0 - 32))), "e0")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgInt(0 - 33))), "d0df")
+    // Big-endian and fixed width, not a varint: 256 is two bytes after
+    // the 0xcd header and not two continuation bytes.
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgInt(256))), "cd0100")
+
+@test
+fn test_every_integer_format_decodes_to_the_same_number()
+    // A writer picks the shortest; a reader takes them all.  These are
+    // five spellings of 1.
+    match mpack.decode(hex("01"))
+        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Err(e) => test.fail(e.message())
+    match mpack.decode(hex("cc01"))
+        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Err(e) => test.fail(e.message())
+    match mpack.decode(hex("cd0001"))
+        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Err(e) => test.fail(e.message())
+    match mpack.decode(hex("ce00000001"))
+        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Err(e) => test.fail(e.message())
+    match mpack.decode(hex("d001"))
+        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_uint_64_above_two_to_the_sixty_third_is_its_own_case()
+    // 0xffffffffffffffff is 18446744073709551615, which does not fit a
+    // signed Int.  `MsgUint` carries the bit pattern, so a reader can
+    // tell it from an actual -1 — and those are two different
+    // documents.
+    match mpack.decode(hex("cfffffffffffffffff"))
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            test.assert_eq(mpack.type_name(v), "uint")
+            // And it is NOT an `as_int`, because answering the bit
+            // pattern would hand a caller a negative number for a
+            // positive document.
+            match mpack.as_int(v)
+                Ok(_)   => test.fail("uint 64 above 2^63 does not fit an Int")
+                Err(e2) =>
+                    match e2
+                        MsgUnexpectedType(at, want, saw) => test.assert_eq(saw, "uint")
+                        _                                => test.fail("expected MsgUnexpectedType: ${e2.message()}")
+
+@test
+fn test_the_two_float_widths_stay_apart()
+    // The width is on the wire, so a value put in as `float 32` comes
+    // back as one.  Otherwise every hop through a relay costs four
+    // extra bytes.
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat32(0.5))), "ca3f000000")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat64(0.5))), "cb3fe0000000000000")
+    match mpack.decode(hex("ca3f000000"))
+        Ok(v)  => test.assert_eq(mpack.type_name(v), "float32")
+        Err(e) => test.fail(e.message())
+    // Both read through `as_float`, for a caller that does not care.
+    match mpack.decode(hex("cb3fe0000000000000"))
+        Ok(v)  => test.assert_eq(mpack.as_float(v) ?? 0.0, 0.5)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_string_is_a_length_and_then_utf8()
+    // fixstr is 0xa0 | len for a length under 32.
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgStr("a"))), "a161")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgStr(""))), "a0")
+    match mpack.decode(hex("a3666f6f"))
+        Ok(v)  => test.assert_eq(mpack.as_str(v) ?? "", "foo")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_bytes_are_their_own_family_and_not_a_string()
+    // The `bin` family was added in 2013 precisely so that a reader can
+    // tell text from bytes without a schema.  0xc4 is `bin 8`.
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgBin(hex("ff00")))), "c402ff00")
+    match mpack.decode(hex("c40161"))
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            test.assert_eq(mpack.type_name(v), "bin")
+            // Valid UTF-8 in a `bin` is still not a string: the
+            // document said otherwise.
+            match mpack.as_str(v)
+                Ok(_)   => test.fail("a bin is not a str even when its bytes would be")
+                Err(e2) =>
+                    match mpack.as_bytes(v)
+                        Ok(raw) => test.assert_eq(bytes.len(raw), 1)
+                        Err(e3) => test.fail(e3.message())
+
+@test
+fn test_an_array_is_a_count_and_then_the_elements()
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgArray([]))), "90")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgArray([MsgInt(1), MsgInt(2)]))), "920102")
+    match mpack.decode(hex("920102"))
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            match mpack.as_array(v)
+                Ok(items) => test.assert_eq(list.len(items), 2)
+                Err(e2)   => test.fail(e2.message())
+
+@test
+fn test_a_map_is_a_count_and_then_alternating_keys_and_values()
+    let one = MsgMap([MsgPair { key: MsgStr("a"), value: MsgInt(1) }])
+    test.assert_eq(bytes.to_hex(mpack.encode(one)), "81a16101")
+    match mpack.decode(hex("81a16101"))
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            match mpack.get(v, "a")
+                Ok(got) => test.assert_eq(mpack.as_int(got) ?? 0, 1)
+                Err(e2) => test.fail(e2.message())
+
+@test
+fn test_a_map_key_is_any_value_and_not_only_a_string()
+    // Which is why `MsgMap` holds a list of pairs rather than anything
+    // keyed: a keyed collection would have had to pick a key type, and
+    // the format does not.
+    let keyed = MsgMap([MsgPair { key: MsgInt(1), value: MsgBool(true) }])
+    test.assert_eq(bytes.to_hex(mpack.encode(keyed)), "8101c3")
+    match mpack.decode(hex("8101c3"))
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            match mpack.as_map(v)
+                Ok(entries) => test.assert_eq(list.len(entries), 1)
+                Err(e2)     => test.fail(e2.message())
+
+@test
+fn test_duplicate_keys_survive_to_the_caller_and_the_first_one_wins()
+    // The specification permits duplicates and does not say which wins,
+    // so `get` answers the one a reader scanning the document reaches
+    // first and `as_map` shows both.
+    match mpack.decode(hex("82a16101a16102"))
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            match mpack.as_map(v)
+                Ok(entries) => test.assert_eq(list.len(entries), 2)
+                Err(e3)     => test.fail(e3.message())
+            match mpack.get(v, "a")
+                Ok(got) => test.assert_eq(mpack.as_int(got) ?? 0, 1)
+                Err(e2) => test.fail(e2.message())
+
+@test
+fn test_an_ext_carries_an_application_type_and_a_payload()
+    // 0xd4 is fixext 1: one type byte, then one payload byte.
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgExt(7, hex("2a")))), "d4072a")
+    match mpack.decode(hex("d4072a"))
+        Ok(v)  => test.assert_eq(mpack.type_name(v), "ext")
+        Err(e) => test.fail(e.message())
+
+// ── The timestamp extension ─────────────────────────────────────────
+
+@test
+fn test_the_timestamp_extension_is_type_minus_one()
+    test.assert_eq(mpack.timestamp_type(), 0 - 1)
+
+@test
+fn test_a_whole_second_timestamp_takes_the_thirty_two_bit_form()
+    // 0xd6 is fixext 4, type 0xff is -1, and the four bytes are the
+    // seconds: 1 is 00000001.
+    let t = MsgTimestamp { seconds: 1, nanos: 0 }
+    test.assert_eq(bytes.to_hex(mpack.encode(mpack.timestamp_value(t))), "d6ff00000001")
+    match mpack.timestamp_of(mpack.timestamp_value(t))
+        Err(e)   => test.fail(e.message())
+        Ok(back) =>
+            test.assert_eq(back.seconds, 1)
+            test.assert_eq(back.nanos, 0)
+
+@test
+fn test_a_timestamp_with_nanoseconds_takes_a_wider_form()
+    // The 64-bit form packs 30 bits of nanoseconds above 34 bits of
+    // seconds, and 0xd7 is fixext 8.
+    let t = MsgTimestamp { seconds: 1, nanos: 1 }
+    let raw = mpack.encode(mpack.timestamp_value(t))
+    test.assert_eq(bytes.len(raw), 10)
+    match mpack.timestamp_of(mpack.timestamp_value(t))
+        Ok(back) => test.assert_eq(back.nanos, 1)
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_an_ext_that_is_not_a_timestamp_is_refused_as_one()
+    match mpack.timestamp_of(MsgExt(7, hex("2a")))
+        Ok(_)  => test.fail("extension type 7 is not the timestamp")
+        Err(e) =>
+            match e
+                MsgUnexpectedType(at, want, saw) => test.assert_eq(want, "timestamp")
+                _                                => test.fail("expected MsgUnexpectedType: ${e.message()}")
+
+@test
+fn test_a_timestamp_of_the_wrong_width_is_refused()
+    // -1 with a three-byte payload is none of the three defined widths.
+    match mpack.timestamp_of(MsgExt(0 - 1, hex("010203")))
+        Ok(_)  => test.fail("three bytes is not one of the three widths")
+        Err(e) =>
+            match e
+                MsgBadTimestamp(at, len) => test.assert_eq(len, 3)
+                _                        => test.fail("expected MsgBadTimestamp: ${e.message()}")
+
+// ── Refusals ────────────────────────────────────────────────────────
+
+@test
+fn test_the_reserved_format_byte_is_refused()
+    // 0xc1 is the one byte the specification reserves and never
+    // assigns, so a document containing it is not MessagePack.
+    match mpack.decode(hex("c1"))
+        Ok(_)  => test.fail("0xc1 is never assigned")
+        Err(e) =>
+            match e
+                MsgReservedFormat(at, tag) =>
+                    test.assert_eq(at, 0)
+                    test.assert_eq(tag, 0xC1)
+                _                          => test.fail("expected MsgReservedFormat: ${e.message()}")
+
+@test
+fn test_a_truncated_value_names_what_it_still_needed()
+    // 0xcd says "two more bytes"; one arrives.
+    match mpack.decode(hex("cd01"))
+        Ok(_)  => test.fail("a uint 16 is three bytes")
+        Err(e) =>
+            match e
+                MsgTruncated(at, need) => test.assert_eq(need, 1)
+                _                      => test.fail("expected MsgTruncated: ${e.message()}")
+
+@test
+fn test_bytes_after_the_value_are_refused_by_decode()
+    // A caller who meant to read one message from a longer buffer wants
+    // `decode_prefix`; this refusal is what tells them so.
+    match mpack.decode(hex("c0c0"))
+        Ok(_)  => test.fail("two nils are two documents")
+        Err(e) =>
+            match e
+                MsgTrailingBytes(at, len) =>
+                    test.assert_eq(at, 1)
+                    test.assert_eq(len, 1)
+                _                         => test.fail("expected MsgTrailingBytes: ${e.message()}")
+
+@test
+fn test_decode_prefix_reads_one_value_and_says_how_long_it_was()
+    match mpack.decode_prefix(hex("c0c3"))
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert_eq(p.consumed, 1)
+            test.assert_eq(mpack.type_name(p.value), "nil")
+
+@test
+fn test_a_string_that_is_not_utf8_is_refused()
+    // 0xa1 is a one-byte fixstr; 0xff is not a UTF-8 sequence.  `bin`
+    // has no such rule, which is what `bin` is for.
+    match mpack.decode(hex("a1ff"))
+        Ok(_)  => test.fail("0xff is not UTF-8")
+        Err(e) =>
+            match e
+                MsgBadUtf8(at) => test.assert_eq(at, 1)
+                _              => test.fail("expected MsgBadUtf8: ${e.message()}")
+
+@test
+fn test_nesting_past_the_limit_is_refused_rather_than_recursed()
+    // A fixarray header is one byte and can open a level, so a
+    // five-byte message can ask for five levels and a hundred-thousand
+    // byte one for a hundred thousand.  The limit turns a stack
+    // overflow into a value.
+    test.assert_eq(mpack.default_depth_limit(), 64)
+    match mpack.decode(hex("919191919191"))
+        Ok(_)  => test.fail("the last array never ends")
+        Err(e) =>
+            match e
+                MsgTruncated(at, need) => test.assert_eq(need, 1)
+                _                      => test.fail("expected MsgTruncated: ${e.message()}")
+
+// ── Sizing, and writing into a buffer the caller owns ───────────────
+
+@test
+fn test_encoded_len_is_exact_because_every_length_is_known_first()
+    test.assert_eq(mpack.encoded_len(MsgNil), 1)
+    test.assert_eq(mpack.encoded_len(MsgInt(127)), 1)
+    test.assert_eq(mpack.encoded_len(MsgInt(128)), 2)
+    test.assert_eq(mpack.encoded_len(MsgStr("foo")), 4)
+    test.assert_eq(mpack.encoded_len(MsgArray([MsgInt(1), MsgInt(2)])), 3)
+
+@test
+fn test_encode_into_writes_into_the_callers_buffer()
+    var dst = bytes.cursor_le(bytes.zeros(8))
+    match mpack.encode_into(MsgArray([MsgInt(1), MsgInt(2)]), dst)
+        Err(e) => test.fail(e.message())
+        Ok(n)  =>
+            test.assert_eq(n, 3)
+            test.assert_eq(bytes.to_hex(bytes.slice(dst.finish(), 0, n)), "920102")
+
+@test
+fn test_encode_into_refuses_a_buffer_smaller_than_the_answer()
+    var dst = bytes.cursor_le(bytes.zeros(2))
+    match mpack.encode_into(MsgArray([MsgInt(1), MsgInt(2)]), dst)
+        Ok(_)  => test.fail("three bytes do not fit two")
+        Err(e) =>
+            match e
+                MsgBufferTooSmall(need, have) =>
+                    test.assert_eq(need, 3)
+                    test.assert_eq(have, 2)
+                _                             => test.fail("expected MsgBufferTooSmall: ${e.message()}")
+
+// ── The stream, fed a chunk at a time ───────────────────────────────
+
+@test
+fn test_a_value_split_across_chunks_finishes_on_the_chunk_that_completes_it()
+    let d0 = mpackdec.decoder()
+    test.assert_eq(mpackdec.pending(d0), 0)
+    test.assert_eq(mpackdec.stream_at(d0), 0)
+
+    match mpackdec.feed(d0, hex("9201"))
+        Err(e)    => test.fail(e.message())
+        Ok(first) =>
+            // Nothing finished: the array wants one more element.
+            test.assert_eq(list.len(first.values), 0)
+            test.assert_eq(mpackdec.pending(first.decoder), 2)
+            match mpackdec.feed(first.decoder, hex("02"))
+                Err(e2)    => test.fail(e2.message())
+                Ok(second) =>
+                    test.assert_eq(list.len(second.values), 1)
+                    test.assert_eq(mpackdec.pending(second.decoder), 0)
+                    test.assert_eq(mpackdec.stream_at(second.decoder), 3)
+
+@test
+fn test_one_chunk_carrying_several_messages_drains_them_all()
+    // A decoder that answered at most one value per chunk would need
+    // the caller to keep feeding empty chunks to drain it.
+    match mpackdec.feed(mpackdec.decoder(), hex("c0c3c2"))
+        Err(e) => test.fail(e.message())
+        Ok(f)  => test.assert_eq(list.len(f.values), 3)
+
+@test
+fn test_a_stream_that_ends_mid_message_is_an_error_only_at_finish()
+    // `feed` never reports truncation — a value that has not arrived
+    // yet is what the held bytes are for — so a peer hanging up is
+    // reported here and nowhere else.
+    match mpackdec.feed(mpackdec.decoder(), hex("cd01"))
+        Err(e) => test.fail(e.message())
+        Ok(f)  =>
+            match mpackdec.finish(f.decoder)
+                Ok(_)   => test.fail("a uint 16 is three bytes")
+                Err(e2) =>
+                    match e2
+                        MsgTruncated(at, need) => test.assert_eq(need, 1)
+                        _                      => test.fail("expected MsgTruncated: ${e2.message()}")
+
+@test
+fn test_a_clean_stream_finishes_without_complaint()
+    match mpackdec.feed(mpackdec.decoder(), hex("c0"))
+        Err(e) => test.fail(e.message())
+        Ok(f)  =>
+            match mpackdec.finish(f.decoder)
+                Ok(d)   => test.assert_eq(mpackdec.pending(d), 0)
+                Err(e2) => test.fail(e2.message())
+
+@test
+fn test_the_depth_limit_travels_on_the_decoder()
+    let shallow = mpackdec.with_depth_limit(mpackdec.decoder(), 2)
+    match mpackdec.feed(shallow, hex("9191c0"))
+        Ok(_)  => test.fail("three levels is past a limit of two")
+        Err(e) =>
+            match e
+                MsgDepthExceeded(at, depth) => test.assert_eq(depth, 2)
+                _                           => test.fail("expected MsgDepthExceeded: ${e.message()}")
+
+// ── The trait bridge ────────────────────────────────────────────────
+
+struct Reading
+    sensor: Int
+    celsius: Float
+
+@test
+fn test_a_struct_writes_itself_as_a_map_keyed_by_member_name()
+    // Which is what every MessagePack binding for a statically typed
+    // language does, and what makes the document readable by a peer
+    // that has never seen the type.
+    match mpackserde.to_bytes(Reading { sensor: 3, celsius: 21.5 })
+        Err(e) => test.fail(e.message())
+        Ok(b)  =>
+            test.assert_eq(bytes.to_hex(b), "82a673656e736f7203a763656c73697573cb4035800000000000")
+
+@test
+fn test_a_struct_reads_itself_back_which_postcard_cannot_do()
+    // The whole difference is that the wire carries the names: `field`
+    // scans the map at the parent's own offset, so the parent never has
+    // to be advanced and the trait's unthreaded cursor is enough.
+    let raw = hex("82a673656e736f7203a763656c73697573cb4035800000000000")
+    let r: Result<Reading, DeserializeError> = mpackserde.from_bytes(raw)
+    match r
+        Err(e) => test.fail(e.message())
+        Ok(x)  =>
+            test.assert_eq(x.sensor, 3)
+            test.assert_eq(x.celsius, 21.5)
+
+@test
+fn test_a_writer_accumulates_and_answers_bytes_without_a_result()
+    // Everything the `Serializer` trait can present has a MessagePack
+    // encoding, which is why this answers `Bytes` where postcard-nv's
+    // answers a `Result`.
+    let w = mpackserde.writer()
+    test.assert_eq(bytes.len(mpackserde.writer_bytes(w)), 0)
+
+@test
+fn test_a_reader_reports_where_it_is()
+    let r = mpackserde.reader(hex("c0"))
+    test.assert_eq(mpackserde.reader_at(r), 0)

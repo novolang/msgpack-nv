@@ -1,0 +1,122 @@
+// mpackdec — the MessagePack decoder as a state machine a host pumps.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THIS IS A SEPARATE MODULE FROM `mpack`.  `mpack.decode` takes a
+// whole document and answers a whole value; this takes a chunk and
+// answers whatever is finished.  They are the same arithmetic with
+// different ownership, and a caller reading a socket has no whole
+// document to hand over — which is exactly the case a `core` package is
+// shaped for, because it is the case where the host has to keep
+// control.
+//
+// THE SHAPE IS FEED AND DRAIN (`docs/publishing.md` § How a `core`
+// package takes bytes from its host): the host pumps chunks in and
+// takes finished values out.  Right here rather than the event form
+// tar-nv uses, because a MessagePack value is a message rather than a
+// file — a sensor batch, an RPC reply, a log record — and a decoder
+// that emitted "array started" events would make every caller
+// reassemble the tree that this one already has.
+//
+// A caller whose SINGLE MESSAGE outgrows memory has the wrong format,
+// not the wrong decoder: MessagePack writes every length in front of
+// its payload, so a producer that streams a gigabyte in one array has
+// already had to know it was a gigabyte.
+
+// A decoder between two chunks.
+//
+// `held` is the tail of the last chunk that did not finish a value —
+// the one thing a streaming decoder must carry — and `at` is the byte
+// offset from the start of the STREAM, so a fault in the fortieth chunk
+// reports where it really was rather than where it was in that chunk.
+//
+// `depth_limit` travels on the decoder rather than on `feed` so that a
+// caller sets it once, and so that two decoders in one program can
+// disagree.
+pub struct MsgDecoder
+    held: Bytes
+    at: Int
+    depth_limit: Int
+
+// A fresh decoder with nothing held, at offset zero, at the default
+// depth limit.
+//
+// ```novo
+// use mpack
+// use mpackdec
+//
+// fn main() [io]
+//     println("${mpackdec.pending(mpackdec.decoder())}")   // 0
+// ```
+pub fn decoder() -> MsgDecoder
+    todo("mpackdec.decoder")
+
+// `d` with a different nesting limit.
+//
+// A caller who genuinely has data ninety levels deep raises it; a
+// caller decoding messages from the network lowers it.  A limit below 1
+// is taken as 1, because a document is at least one value deep.
+pub fn with_depth_limit(d: MsgDecoder, limit: Int) -> MsgDecoder
+    todo("mpackdec.with_depth_limit")
+
+// How many bytes the decoder is holding that did not finish a value.
+//
+// What a caller watching for a stalled producer reads: a `pending` that
+// stops changing while the connection is open is a peer that stopped
+// mid-message.
+pub fn pending(d: MsgDecoder) -> Int
+    todo("mpackdec.pending")
+
+// How many bytes of the stream the decoder has consumed, counted from
+// the first chunk.
+//
+// The offset every `MsgError` is reported against.
+pub fn stream_at(d: MsgDecoder) -> Int
+    todo("mpackdec.stream_at")
+
+// What one `feed` produced: the decoder after it, and the values that
+// finished.
+//
+// `values` is empty when the chunk did not complete anything, which is
+// the ordinary case for a large message arriving in small pieces, and
+// holds more than one when a chunk carried several — a decoder that
+// answered at most one value per chunk would need the caller to keep
+// feeding empty chunks to drain it.
+pub struct MsgFeed
+    decoder: MsgDecoder
+    values: [MsgValue]
+
+// Feed a chunk, and answer everything it finished.
+//
+// The fault cases are `mpack`'s and mean the same things, with `at`
+// counted from the start of the stream: a reserved format byte, a `str`
+// that is not UTF-8, or nesting past the limit.  `MsgTruncated` is NOT
+// among them — a value that has not arrived yet is what `held` is for,
+// and only `finish` calls an unfinished value an error.
+//
+// ```novo
+// use std.bytes
+// use std.list
+// use mpack
+// use mpackdec
+//
+// fn main() [io]
+//     // 92 01 02 is a two-element array, split across two chunks.
+//     match mpackdec.feed(mpackdec.decoder(), bytes.from_hex("9201") ?? bytes.zeros(0))
+//         Err(e)    => println(e.message())
+//         Ok(first) =>
+//             println("${list.len(first.values)}")   // 0 — nothing finished yet
+// ```
+pub fn feed(d: MsgDecoder, chunk: Bytes) -> Result<MsgFeed, MsgError>
+    todo("mpackdec.feed")
+
+// Declare the stream over.
+//
+// `MsgTruncated` when a partial value is still held, naming how many
+// more bytes it needed, and the decoder back otherwise.  This is the
+// call that turns a peer hanging up mid-message into an error instead
+// of silence, and it is the reason `feed` does not report truncation
+// itself.
+pub fn finish(d: MsgDecoder) -> Result<MsgDecoder, MsgError>
+    todo("mpackdec.finish")

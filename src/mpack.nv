@@ -1,0 +1,401 @@
+// mpack — the MessagePack value tree and the encoder that writes it.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THE MODULE IS NOT CALLED `msgpack`.  serde-nv already ships a
+// module of that name — the subset its trait walk needs — and two
+// dependencies of one program may not both ship a module with the same
+// name.  `mpack` is what the C implementation of this format is called,
+// so the spelling is a borrowing rather than an invention.  The README
+// says what this package adds over that module and why both exist.
+//
+// WHAT IT IS.  MessagePack is JSON's data model with the tags on the
+// wire: every value begins with a format byte that says what it is and
+// how long it is, so a reader that has never seen the schema can walk a
+// document and a writer never has to announce anything twice.  That is
+// the whole difference from postcard-nv, and it is the reason the trait
+// bridge in `mpackserde` works where postcard's read half does not.
+//
+// THREE SURFACES, and a reader should know which one they are on.
+//
+//   * The VALUE TREE — this module — is the format itself: build a
+//     `MsgValue`, encode it, decode bytes back to one.  Reach for it
+//     when the other end is not novo-lang, when the document's shape is
+//     not a struct, or when a map's keys are not strings.
+//   * The STREAM — `mpackdec` — is the same decoder fed a chunk at a
+//     time, for a document that arrives off a socket in pieces.
+//   * The TRAIT bridge — `mpackserde` — writes a novo-lang type with no
+//     code to write, over the standard library's `Serialize` and
+//     `Deserialize`.  Reach for it when both ends are novo-lang.
+//
+// THE SPECIFICATION is the MessagePack format specification at
+// github.com/msgpack/msgpack, revision 2 (2017-08-09), and every vector
+// in the tests is from it.
+
+// A MessagePack value.
+//
+// The eleven cases are the specification's nine format families with
+// the integers split by signedness and the floats split by width,
+// because both distinctions survive a round trip on the wire and
+// neither survives novo-lang's `Int` and `Float`.
+//
+// The names are all prefixed because a variant is constructed by name
+// across the whole assembly, and `Nil`, `Str` and `Map` are names every
+// codec wants.
+pub enum MsgValue
+    // `0xc0`.  The absence of a value, and what a `?T` member that is
+    // `None` writes.
+    MsgNil
+    // `0xc2` and `0xc3`.
+    MsgBool(v: Bool)
+    // The signed integer family: positive and negative fixint, `int 8`
+    // through `int 64`, and the `uint` formats small enough to fit a
+    // signed 64-bit integer.
+    //
+    // An encoder writes the SHORTEST format that holds `v`, which is
+    // what the specification recommends and what every other
+    // implementation does; a decoder accepts every format and answers
+    // this.  So the round trip preserves the number and not the
+    // spelling, and a document whose author wrote `0` as `int 64` comes
+    // back as one byte.
+    MsgInt(v: Int)
+    // `uint 64` with its top bit set — a value from 2^63 to 2^64 - 1,
+    // which does not fit a signed `Int`.
+    //
+    // `bits` is the bit pattern, so it reads as a negative number.  A
+    // separate case rather than a silent reinterpretation, because a
+    // reader that saw `MsgInt(-1)` for `18446744073709551615` would have
+    // no way to tell it from an actual `-1` — and those are two
+    // different documents.
+    MsgUint(bits: Int)
+    // `0xca`.  Kept apart from `MsgFloat64` because the width is on the
+    // wire and a document that round-trips has to come back the size it
+    // went out; a value put in as `float 32` and taken out as `float 64`
+    // is four extra bytes on every hop.
+    MsgFloat32(v: Float)
+    // `0xcb`, and what a novo-lang `Float` is.
+    MsgFloat64(v: Float)
+    // The `str` family: fixstr, `str 8`, `str 16`, `str 32`.  UTF-8 by
+    // specification, and a decoder refuses bytes that are not.
+    MsgStr(v: Str)
+    // The `bin` family: `bin 8`, `bin 16`, `bin 32`.
+    //
+    // MessagePack separated this from `str` in 2013 precisely so that a
+    // reader can tell text from bytes without a schema, and it is the
+    // family the standard library's `Serialize` trait has no hook for —
+    // see the README.
+    MsgBin(v: Bytes)
+    // The `array` family: fixarray, `array 16`, `array 32`.
+    MsgArray(items: [MsgValue])
+    // The `map` family: fixmap, `map 16`, `map 32`.
+    //
+    // A LIST of pairs rather than a keyed collection, for two reasons
+    // the format forces: a MessagePack key is any value and not only a
+    // string, and the specification permits duplicate keys and does not
+    // say which wins.  A reader that wants "the value for `name`" calls
+    // `get`; a reader that is checking a document for duplicates needs
+    // to see them, and a keyed collection would have silently dropped
+    // one.
+    MsgMap(entries: [MsgPair])
+    // The `ext` family: fixext 1/2/4/8/16, `ext 8`, `ext 16`, `ext 32`.
+    //
+    // `kind` is the application-defined type, `-128 ..= 127`; the
+    // negative half is reserved for the specification and `-1` is the
+    // timestamp extension, which `timestamp_of` reads.
+    MsgExt(kind: Int, data: Bytes)
+
+// One entry of a `MsgMap`.
+//
+// A struct rather than a two-element array because both halves are
+// values and an array of two `MsgValue`s reads as an array of two
+// values, which is a different document.
+pub struct MsgPair
+    key: MsgValue
+    value: MsgValue
+
+// A timestamp, as the `-1` extension carries one.
+//
+// The specification defines three widths — 32-bit seconds, 64-bit
+// seconds with 30 bits of nanoseconds, and a 96-bit form with a signed
+// 64-bit seconds field — and an encoder picks the shortest that holds
+// the value.  This is the decoded form of all three.
+//
+// A `core` package has no clock, so a caller supplies the seconds.
+// That is the same rule that makes a gzip header's mtime a parameter,
+// and it is what makes a document reproducible.
+pub struct MsgTimestamp
+    // Seconds since the Unix epoch, which may be negative.
+    seconds: Int
+    // `0 ..= 999999999`.  A value outside that range is
+    // `MsgBadTimestamp` on the way in and on the way out.
+    nanos: Int
+
+// What went wrong reading or writing MessagePack bytes.
+//
+// Every variant but the last two is an input fault, so it is a value:
+// bytes arriving off a wire are data, and refusing to answer is a
+// result while crashing is not.  Each carries the offset it was found
+// at.
+//
+// The names are all prefixed because a variant is constructed by name
+// across the whole assembly, and `Truncated` is the name every codec
+// wants.
+pub enum MsgError
+    // The buffer ended in the middle of a value.  `need` is how many
+    // more bytes the header said were coming.
+    MsgTruncated(at: Int, need: Int)
+    // `0xc1`, the one byte the specification reserves and never
+    // assigns.  A document containing it is not MessagePack.
+    MsgReservedFormat(at: Int, tag: Int)
+    // A `str` whose bytes are not UTF-8.  `bin` has no such rule, which
+    // is what `bin` is for.
+    MsgBadUtf8(at: Int)
+    // The value nested deeper than the decoder's limit.
+    //
+    // Not pedantry: an array header costs one byte and can open a
+    // hundred thousand levels, so a decoder without a limit is a stack
+    // overflow that arrives as a five-byte message.
+    MsgDepthExceeded(at: Int, depth: Int)
+    // A value was read and bytes were left over.  A caller decoding one
+    // message from one buffer wants to know; a caller reading a stream
+    // uses `mpackdec` instead and never meets this.
+    MsgTrailingBytes(at: Int, len: Int)
+    // An accessor was asked for one type and the value was another.
+    // `want` and `saw` are `type_name`'s spellings.
+    MsgUnexpectedType(at: Int, want: Str, saw: Str)
+    // An `ext` of type `-1` whose payload is not 4, 8 or 12 bytes, or
+    // whose nanoseconds field is out of range.
+    MsgBadTimestamp(at: Int, len: Int)
+    // The destination handed to `encode_into` was shorter than
+    // `encoded_len` says.  Nothing is written in that case: a partially
+    // encoded buffer is worse than none, because it looks like a
+    // document.
+    MsgBufferTooSmall(need: Int, have: Int)
+
+// The standard `Error` implementation, so a bad document can be
+// reported by anything that reports errors.
+impl Error for MsgError
+    // Answer the one-line report: what was wrong, and at what byte
+    // offset.
+    fn message(self) -> Str
+        todo("mpack.MsgError.message")
+
+// ── Reading a value that has already been decoded ───────────────────
+
+// The family `v` belongs to, as the specification spells it: `nil`,
+// `bool`, `int`, `uint`, `float32`, `float64`, `str`, `bin`, `array`,
+// `map` or `ext`.
+//
+// What `MsgUnexpectedType` reports, and what a caller printing a
+// document's shape uses.
+//
+// ```novo
+// use mpack
+//
+// fn main() [io]
+//     println(mpack.type_name(MsgNil))   // nil
+// ```
+pub fn type_name(v: MsgValue) -> Str
+    todo("mpack.type_name")
+
+// The integer in `v`, or `MsgUnexpectedType`.
+//
+// `MsgUint` is NOT accepted here even though it holds an integer: its
+// value does not fit a signed `Int`, and answering the bit pattern
+// would hand a caller a negative number for a positive document.
+pub fn as_int(v: MsgValue) -> Result<Int, MsgError>
+    todo("mpack.as_int")
+
+// The boolean in `v`, or `MsgUnexpectedType`.
+pub fn as_bool(v: MsgValue) -> Result<Bool, MsgError>
+    todo("mpack.as_bool")
+
+// The float in `v`, or `MsgUnexpectedType`.
+//
+// Both widths answer here: a caller that cares which one it was matches
+// on the value instead.
+pub fn as_float(v: MsgValue) -> Result<Float, MsgError>
+    todo("mpack.as_float")
+
+// The string in `v`, or `MsgUnexpectedType`.
+//
+// A `MsgBin` is not a string even when its bytes happen to be UTF-8,
+// because the document said otherwise and that distinction is what the
+// `bin` family was added for.
+pub fn as_str(v: MsgValue) -> Result<Str, MsgError>
+    todo("mpack.as_str")
+
+// The bytes in `v`, or `MsgUnexpectedType`.
+pub fn as_bytes(v: MsgValue) -> Result<Bytes, MsgError>
+    todo("mpack.as_bytes")
+
+// The elements of `v`, or `MsgUnexpectedType`.
+pub fn as_array(v: MsgValue) -> Result<[MsgValue], MsgError>
+    todo("mpack.as_array")
+
+// The entries of `v`, in the order the document wrote them, or
+// `MsgUnexpectedType`.
+pub fn as_map(v: MsgValue) -> Result<[MsgPair], MsgError>
+    todo("mpack.as_map")
+
+// The value `key` maps to in `v`, or `MsgUnexpectedType` when `v` is
+// not a map and `MsgUnexpectedType` with `want` naming the key when it
+// has no such entry.
+//
+// The FIRST match wins, because the specification permits duplicate
+// keys and does not say which one does — so this answers the one a
+// reader scanning the document would reach first, and a caller that
+// cares about duplicates walks `as_map` instead.
+//
+// ```novo
+// use std.bytes
+// use mpack
+//
+// fn main() [io]
+//     // 81 a1 61 01 — a one-entry map, "a" to 1.
+//     match mpack.decode(bytes.from_hex("81a16101") ?? bytes.zeros(0))
+//         Err(e) => println(e.message())
+//         Ok(doc) =>
+//             match mpack.get(doc, "a")
+//                 Ok(v)   => println(mpack.type_name(v))   // int
+//                 Err(e2) => println(e2.message())
+// ```
+pub fn get(v: MsgValue, key: Str) -> Result<MsgValue, MsgError>
+    todo("mpack.get")
+
+// ── The timestamp extension ─────────────────────────────────────────
+
+// The extension type the specification reserves for timestamps: -1.
+//
+// The only negative `ext` type assigned, and the reason `MsgExt.kind`
+// is signed.
+pub fn timestamp_type() -> Int
+    todo("mpack.timestamp_type")
+
+// `t` as the `ext` value that carries it, in the shortest of the three
+// widths that holds it.
+//
+// 32-bit when the nanoseconds are zero and the seconds fit 32 bits
+// unsigned; 64-bit when the seconds fit 34 bits; 96-bit otherwise.  A
+// nanoseconds field outside `0 ..= 999999999` answers `MsgNil` rather
+// than a malformed extension — the refusal a caller can act on is
+// `timestamp_of`'s, on the way back.
+pub fn timestamp_value(t: MsgTimestamp) -> MsgValue
+    todo("mpack.timestamp_value")
+
+// The timestamp `v` carries, or `MsgUnexpectedType` when `v` is not an
+// `ext` of type -1, or `MsgBadTimestamp` when its payload is not one of
+// the three widths.
+//
+// ```novo
+// use mpack
+//
+// fn main() [io]
+//     let t = MsgTimestamp { seconds: 1, nanos: 0 }
+//     match mpack.timestamp_of(mpack.timestamp_value(t))
+//         Ok(back) => println("${back.seconds}")   // 1
+//         Err(e)   => println(e.message())
+// ```
+pub fn timestamp_of(v: MsgValue) -> Result<MsgTimestamp, MsgError>
+    todo("mpack.timestamp_of")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// The first byte the shortest encoding of `v` begins with.
+//
+// What a reader checking this package against the specification's
+// format table reads, and what a caller peeking at a document's first
+// byte compares against.
+pub fn format_byte(v: MsgValue) -> Int
+    todo("mpack.format_byte")
+
+// How many bytes `v` encodes to, without encoding it.
+//
+// What a caller sizing the destination for `encode_into` asks first.
+// Exact rather than an upper bound: MessagePack's lengths are all known
+// before the bytes are written, which is what makes the format
+// one-pass.
+//
+// ```novo
+// use mpack
+//
+// fn main() [io]
+//     println("${mpack.encoded_len(MsgInt(1))}")   // 1 — a positive fixint
+// ```
+pub fn encoded_len(v: MsgValue) -> Int
+    todo("mpack.encoded_len")
+
+// Encode `v` and answer the bytes.
+//
+// The shortest format that holds each value, which is what the
+// specification recommends and what every other implementation
+// produces.  It cannot fail: every `MsgValue` has an encoding, and a
+// `MsgTimestamp` with an impossible nanoseconds field was refused when
+// it was built.
+//
+// ```novo
+// use std.bytes
+// use mpack
+//
+// fn main() [io]
+//     println(bytes.to_hex(mpack.encode(MsgArray([MsgInt(1), MsgInt(2)]))))
+//     // 920102 — fixarray of two, then two positive fixints
+// ```
+pub fn encode(v: MsgValue) -> Bytes
+    todo("mpack.encode")
+
+// Encode `v` into a buffer the caller already owns, and answer the
+// bytes written.
+//
+// `MsgBufferTooSmall` when the cursor has less room than `encoded_len`
+// says, and nothing is written in that case.
+pub fn encode_into(v: MsgValue, mut dst: Cursor) -> Result<Int, MsgError>
+    todo("mpack.encode_into")
+
+// ── Reading bytes ───────────────────────────────────────────────────
+
+// Decode `src` as exactly one document.
+//
+// Bytes after the value are `MsgTrailingBytes`: a caller who meant to
+// read one message from a longer buffer wants `decode_prefix`, and a
+// caller reading a stream wants `mpackdec`.
+//
+// ```novo
+// use std.bytes
+// use mpack
+//
+// fn main() [io]
+//     match mpack.decode(bytes.from_hex("c0") ?? bytes.zeros(0))
+//         Ok(v)  => println(mpack.type_name(v))   // nil
+//         Err(e) => println(e.message())
+// ```
+pub fn decode(src: Bytes) -> Result<MsgValue, MsgError>
+    todo("mpack.decode")
+
+// One value and the bytes it occupied: what `decode_prefix` answers.
+//
+// `consumed` is the only way to find the start of the next message,
+// because MessagePack has no terminator and no framing — a document's
+// end is wherever its outermost value ended.
+pub struct MsgPrefix
+    value: MsgValue
+    consumed: Int
+
+// Decode the first document in `src` and say how long it was.
+//
+// What a caller reading a length-delimited log of messages out of one
+// buffer wants.  A buffer that ends inside the value is `MsgTruncated`,
+// which is also how a caller learns to read more.
+pub fn decode_prefix(src: Bytes) -> Result<MsgPrefix, MsgError>
+    todo("mpack.decode_prefix")
+
+// The deepest nesting `decode` and `decode_prefix` accept: 64.
+//
+// A fixarray header is one byte and can open a level, so a document of
+// a hundred thousand bytes can ask for a hundred thousand levels of
+// recursion.  The limit is what turns that from a crash into a
+// `MsgDepthExceeded`, and `mpackdec.with_depth_limit` is how a caller
+// who genuinely has deeper data raises it.
+pub fn default_depth_limit() -> Int
+    todo("mpack.default_depth_limit")
