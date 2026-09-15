@@ -1,6 +1,6 @@
 [package]
 name        = "msgpack-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "MessagePack, whole: every format family including bin, ext and the timestamp extension, a value tree, an encoder into a caller's buffer, a feed-and-drain decoder for a stream that arrives in pieces, and a serde bridge so a struct writes itself.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

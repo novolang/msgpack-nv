@@ -1,194 +1,235 @@
 # msgpack-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+MessagePack is a binary format for the same data JSON describes:
+numbers, strings, booleans, nothing, arrays and maps. Every value begins
+with a **format byte** saying what it is and how long it is, so a reader
+that has never seen the schema can walk a document, and `{"a":1}` costs
+four bytes rather than seven. The format is defined by the
+[MessagePack specification](https://github.com/msgpack/msgpack/blob/master/spec.md),
+revision 2 of 9 August 2017. This package implements all of it.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What MessagePack is
 
-MessagePack, whole.  JSON's data model with the tags on the wire: every
-value begins with a format byte that says what it is and how long it is,
-so a reader that has never seen the schema can walk a document and a
-`{"a":1}` that costs seven bytes as JSON costs four here.
+A document is one value. A value is a format byte and then, for the
+types that need it, a length and a payload. A format that carries its
+own types this way is called **self-describing**: nothing outside the
+bytes is needed to read them.
 
-Three surfaces, and a reader should know which one they are on.
+The specification groups the format bytes into **families**. The `str`
+family is text, and its bytes are UTF-8. The `bin` family is bytes, and
+it was separated from `str` in 2013 so that a reader can tell text from
+data with no schema. The `array` and `map` families carry a count and
+then that many values, or that many key and value pairs. A map key is
+any value, not only a string.
 
-| surface | module | reach for it when |
-| --- | --- | --- |
-| the **value tree** | `mpack` | the other end is not novo-lang, the document's shape is not a struct, or a map's keys are not strings |
-| the **stream** | `mpackdec` | the document arrives off a socket in pieces |
-| the **trait bridge** | `mpackserde` | both ends are novo-lang and you would rather not write any code |
+The `ext` family is an application-defined type: a small signed number
+and a payload. Negative type numbers are reserved by the specification,
+and `-1` is the **timestamp extension**, which carries seconds and
+nanoseconds in one of three widths.
 
-## Adding it, and checking it
+Integers are big-endian and fixed width: one, two, four or eight bytes,
+chosen by the format byte in front of them. An encoder writes the
+shortest format that holds the number, so a round trip preserves the
+value and not the spelling.
 
-```bash
-novo pkg add msgpack-nv       # into your novo.toml
-novo pkg build                # type- and effect-check the package
-novo test --isolate tests/msgpack_tests.nv
+| Quantity | Value |
+| --- | --- |
+| Format byte for nil | `0xc0` |
+| Format bytes for false and true | `0xc2`, `0xc3` |
+| Format byte reserved and never assigned | `0xc1` |
+| Format bytes for the two float widths | `0xca` (32-bit), `0xcb` (64-bit) |
+| Timestamp extension type | -1 |
+| Timestamp payload widths | 4, 8 or 12 bytes |
+| Nanoseconds field range | 0 to 999999999 |
+| Range of an `ext` type number | -128 to 127 |
+| Default nesting limit of a decoder | 64 |
+| Cost of a two-entry map of short keys | 9 bytes |
+
+## Install
+
+```
+novo pkg add msgpack-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: mpack.<fn>`.  They turn green one
-at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
 use std.bytes
 use mpack
 
 fn main() [io]
+    // A document built as a value tree: a map of two entries.
     let doc = MsgMap([
         MsgPair { key: MsgStr("id"), value: MsgInt(7) },
         MsgPair { key: MsgStr("ok"), value: MsgBool(true) },
     ])
+
+    // Nine bytes: 82 a2 69 64 07 a2 6f 6b c3.
     println(bytes.to_hex(mpack.encode(doc)))
-    // 82a26964 07a26f6b c3 — a two-entry map in nine bytes
 ```
 
-## serde-nv already has a MessagePack module — why this one?
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a `not implemented: mpack.<fn>`
+panic. The tests are the specification the implementation will have to
+satisfy.
 
-`serde-nv`'s `msgpack` module is the **subset its trait walk needs**: a
-writer and an offset cursor covering the formats a novo-lang struct
-produces.  Its own `skip` says so — it answers 0 for a header "this
-subset does not cover" — and it has no value tree, no streaming, no
-`bin`, no `ext` and no timestamp.
+## What the package contains
 
-This package is the whole format.  What it adds:
+| Module | Contents |
+| --- | --- |
+| `mpack` | The value tree and the format itself: the eleven cases of a value, the accessors, the timestamp extension, the size question, encode, and decode of a whole document or of one document and its length. |
+| `mpackdec` | The same decoder fed a chunk at a time, for a document that arrives in pieces. It holds the tail that did not finish a value, and counts offsets from the start of the stream. |
+| `mpackserde` | The bridge to the standard library's `Serialize` and `Deserialize` traits, so a novo-lang type writes and reads itself with no code to write. |
 
-- **A value tree.**  `MsgValue` for documents whose shape is not a
-  struct: a configuration file, an RPC envelope, anything written by a
-  Python or Ruby peer.
-- **The families the walk cannot produce.**  `bin`, `ext`, the
-  timestamp extension, `uint 64` above 2^63, and `float 32`.
-- **A streaming decoder.**  `mpackdec` takes a chunk and answers
-  whatever finished, so a socket reader does not have to buffer a whole
-  message before it knows there is one.
-- **Named refusals with offsets.**  The reserved format byte, a
-  truncation that says how many bytes it still wanted, a non-UTF-8
-  `str`, a depth limit, trailing bytes.
+## How to choose an entry point
 
-Both can be in one program: the module names and the type names are
-disjoint on purpose (`mpack` and `MsgValue` here, `msgpack` and
-`MsgPackWriter` there).  That disjointness is also the reason this
-module is not called `msgpack` — two dependencies of one program may
-not both ship a module of the same name, and serde-nv had the name
-first.  `mpack` is what the C implementation of this format is called,
-so the spelling is a borrowing rather than an invention.
+**`mpack` is the value tree.** Reach for it when the other end is not
+novo-lang, when the document's shape is not a struct, when a map's keys
+are not strings, or when you need `bin`, `ext`, a timestamp, a 32-bit
+float or an unsigned integer above 2^63.
 
-**This package does not depend on serde-nv.**  The `Serializer` and
-`Deserializer` traits are the standard library's (`std.serialize`), and
-a dependency would put a second MessagePack implementation in every
-consumer's assembly.
+**`mpackdec` is the streaming decoder.** Reach for it when the document
+arrives off a socket in pieces. Feed a chunk, take whatever finished.
 
-## Is the serde bridge writable today? Yes — both halves
+**`mpackserde` is the trait bridge.** Reach for it when both ends are
+novo-lang and the data is a struct. `to_bytes` and `from_bytes` are the
+whole surface for that case.
 
-This is the question the interface milestone exists to answer, and for
-this format the answer is yes, where for postcard-nv it was half no.
-The difference is entirely that MessagePack is self-describing.
+**`mpack.decode_prefix` reads one document out of a buffer of many.**
+MessagePack has no terminator, so `consumed` is the only way to find
+where the next one starts.
 
-**The read half works.**  postcard-nv's `Deserializer` cannot be written
-correctly because `field(self, name)` answers a child cursor and leaves
-the parent unchanged, and a nameless format's member 2 begins wherever
-member 1 ended — which the parent has no way to learn.  MessagePack
-writes a key in front of every member, so `field("beta")` **scans the
-map at the parent's own offset** and needs no threading at all.  The
-parent is never advanced because it never has to be.  serde-nv's
-existing reader is built exactly that way and works, which is the proof
-rather than the argument.
+## The rules a user needs
 
-**The write half works too.**  postcard-nv cannot write an optional
-because the trait announces `None` (as `put_null`) and announces `Some`
-not at all, so a present optional reaches the format as a bare value
-with no discriminant in front of it.  MessagePack needs no
-discriminant: `nil` is `0xc0` and is distinguishable from every other
-value by its own format byte, so `None` is `put_null` and `Some(x)` is
-`x`, and the two are already different documents.
+1. **An encoder writes the shortest format that holds the value.** The
+   specification recommends it and every implementation does it. A
+   document whose author wrote `0` as an eight-byte integer comes back
+   as one byte, so a round trip preserves the number and not the
+   spelling.
+2. **An unsigned 64-bit value above 2^63 is its own case.** `MsgUint`
+   carries the bit pattern, which reads as a negative number. A reader
+   that answered `MsgInt(-1)` for `18446744073709551615` would give a
+   caller no way to tell it from an actual `-1`.
+3. **The two float widths stay apart.** `MsgFloat32` and `MsgFloat64`
+   are different cases, because the width is on the wire and a value
+   that goes out as four bytes should not come back as eight.
+4. **`str` is UTF-8 and `bin` is not checked.** A `str` whose bytes are
+   not UTF-8 is `MsgBadUtf8`. That rule is what `bin` exists to avoid.
+5. **A map is a list of pairs, not a keyed collection.** A key is any
+   value, and the specification permits duplicate keys without saying
+   which wins. `mpack.get` answers the first match, which is what a
+   reader scanning the document reaches. A caller checking for
+   duplicates walks `mpack.as_map`.
+6. **A decoder has a nesting limit, and it is 64 by default.** An array
+   header is one byte and can open a level, so a small document can ask
+   for a hundred thousand levels of recursion. Past the limit is
+   `MsgDepthExceeded`. `mpackdec.with_depth_limit` raises or lowers it,
+   and the limit travels on the decoder so that two decoders in one
+   program may differ.
+7. **`mpack.decode` refuses trailing bytes.** One buffer, one document.
+   A caller reading several uses `decode_prefix` or `mpackdec`.
+8. **`0xc1` is not MessagePack.** The specification reserves that byte
+   and never assigns it. `MsgReservedFormat` names its offset.
+9. **A truncation says how many bytes it still wanted.**
+   `MsgTruncated(at, need)`. For a stream reader that is how it learns
+   to read more.
+10. **The timestamp's seconds are the caller's argument.** This package
+    has no clock. `mpack.timestamp_value` picks the shortest of the
+    three widths, and nanoseconds outside 0 to 999999999 are refused on
+    the way back as `MsgBadTimestamp`.
+11. **`mpack.encode_into` writes nothing when the destination is
+    short.** Size it with `mpack.encoded_len`, which is exact because
+    every length is known before anything is written.
+12. **A struct written through the trait bridge becomes a map keyed by
+    member name.** Not an array of members in declaration order. The
+    array form is half the size, and the traits give a reader no way to
+    know which convention the writer used.
 
-So both stdlib defects postcard-nv found are consequences of a
-**nameless, untagged** format, and a self-describing one meets neither.
+## What is not included
 
-## Where the trait bridge is still short of the format
+- **A build for a microcontroller.** The surface speaks `Bytes`, `Str`
+  and `Result`, none of which links on a device today, so this package
+  makes no device claim and carries no probe.
+  [cbor-nv](https://novo-lang.org/packages/cbor-nv) is the format with a
+  device half.
+- **Unsigned integers above 2^63 through the trait bridge.** The
+  standard library's `Serialize` has one integer hook, `put_int(Int)`,
+  and no way to say "unsigned, and it does not fit". Build such a
+  document with `MsgUint`.
+- **32-bit floats through the trait bridge.** `put_float` writes the
+  64-bit form always. Build `MsgFloat32` for the narrow one, which is
+  what most embedded producers send.
+- **The `bin` family through the trait bridge.** The standard library
+  declares `Serialize` for `Int`, `Float`, `Bool` and `Str`, and has no
+  hook for `Bytes`. A member that is really bytes travels as a `str` of
+  whatever the caller encoded it to, or the document is built with
+  `MsgBin`. A `put_bytes` hook would close this, and would close it for
+  cbor-nv too.
+- **Non-string map keys through the trait bridge.** `begin_struct` and
+  `field(name)` are the only way in, so a document keyed by integers is
+  built with `MsgMap`.
+- **A dependency on
+  [leb128-nv](https://novo-lang.org/packages/leb128-nv) or
+  [zigzag-nv](https://novo-lang.org/packages/zigzag-nv).** MessagePack's
+  integers are big-endian and fixed width, not variable-length
+  quantities.
+- **Any input or output.** Every function here is arithmetic over bytes
+  the caller already holds.
 
-Four places, and every one has the value tree as its answer.  None of
-them blocks the impl; they are the reason `mpack` exists beside it.
+## Related packages
 
-**One integer hook.**  `put_int(v: Int)` is all there is, so `uint 64`
-above 2^63 is unreachable: the walk has no way to say "this is
-unsigned and it does not fit".  A document that needs one is built with
-`MsgUint`.  The read side refuses such a value rather than answering the
-bit pattern, because a negative number for a positive document is worse
-than an error.
+- [serde-nv](https://novo-lang.org/packages/serde-nv) has a `msgpack`
+  module, which is the subset its own trait walk produces: a writer and
+  an offset cursor, with no value tree, no streaming, no `bin`, no `ext`
+  and no timestamp. Both packages can be in one program, because the
+  module and type names are disjoint: `mpack` and `MsgValue` here,
+  `msgpack` and `MsgPackWriter` there. This package does not depend on
+  it; the traits come from `std.serialize`.
+- [cbor-nv](https://novo-lang.org/packages/cbor-nv) is the other
+  self-describing binary format, standardised as RFC 8949. It is the one
+  to reach for on a device.
+- [postcard-nv](https://novo-lang.org/packages/postcard-nv) is the
+  opposite trade: no tags on the wire at all, so it is smaller and both
+  ends must already agree on the schema.
+- [protobuf-nv](https://novo-lang.org/packages/protobuf-nv) tags fields
+  by number rather than by name, and needs a schema for everything else.
 
-**One float hook.**  `put_float(v: Float)` writes `float 64`, always.
-`float 32` halves the bytes of a sensor reading and is what most
-embedded producers send; a caller who wants it builds `MsgFloat32`.
+## Tests
 
-**No bytes hook.**  The trait has `put_str` and nothing for `Bytes` —
-the standard library declares `Serialize` for `Int`, `Float`, `Bool` and
-`Str` and for nothing else — so the entire `bin` family is unreachable
-from the walk.  A member that is really bytes travels as a `str` of
-whatever the caller encoded it to, or the document is built with
-`MsgBin`.  This is the one of the four that is a standard library gap
-rather than a novo-lang/MessagePack impedance: a `Serialize` impl for
-`Bytes` and a `put_bytes` hook would close it, and would close the same
-gap for cbor-nv.
+```bash
+novo test tests/msgpack_tests.nv      # 35 tests
+```
 
-**Struct keys are always strings.**  `begin_struct` and `field(name)`
-are the only way into a map, so a document whose keys are integers —
-which MessagePack permits and which a compact protocol uses — has to be
-built with `MsgMap`.
+Every vector is from the specification's format table, its worked
+examples or its timestamp section. The implementations to check a port
+against are `msgpack-python` and the `rmp` crate in Rust.
 
-One thing that is a **choice** rather than a shortfall: a struct writes
-itself as a `map` keyed by member name, not as an `array` of its members
-in declaration order.  The array form is half the bytes and is what two
-novo-lang programs sharing a schema would rather have.  It is
-deliberately not what this does, because the trait gives the reader no
-way to know which convention the writer chose, and a package with both
-would produce documents that decode as the wrong shape with no
-diagnostic.
+The suite asserts that nil and the booleans are one byte each, that an
+integer takes the shortest format that holds it and that every format
+decodes to the same number, that an unsigned value above 2^63 is its own
+case, that the two float widths stay apart, that bytes are their own
+family, that a map key is any value, that duplicate keys survive to the
+caller with the first one winning, that the timestamp extension is type
+-1 and picks its width, that the reserved format byte is refused, that a
+truncation names what it still needed, that nesting past the limit is
+refused rather than recursed, that a value split across chunks finishes
+on the chunk that completes it, that one chunk carrying several messages
+drains them all, and that a struct writes itself as a map and reads
+itself back.
 
-## The layer, and why
+The tests compile today and fail at run, each on the `not implemented`
+panic that is its body. That is the expected state of an interface
+release. They turn green one at a time as bodies land.
 
-`core`.  Everything here is arithmetic over bytes the caller already
-holds, and no function declares an effect — a wire format has nowhere to
-put one.  The timestamp extension takes its seconds as a parameter for
-the same reason a gzip header's mtime is a parameter: **a `core` package
-has no clock**, and a document that cannot ask for the time is a
-document that is reproducible.
+## Implementation status
 
-It carries **no `tests/embedded_probe.nv`**, so it makes no device
-claim, and the audit's `core-embedded` row passes by saying so.  That is
-deliberate: the surface speaks `Bytes`, `Str` and `Result`, and none of
-the three links at `@tier(embedded)` today.  **cbor-nv is the one of
-this pair with a device half**, because the grid's row for it says the
-embedded tier prefers CBOR — and the two formats are close enough that
-an embedded producer choosing between them should choose the one that
-compiles.
-
-## Not leb128-nv, not zigzag-nv
-
-postcard-nv depends on both, and a reader coming from there will look
-for them here.  MessagePack's integers are **big-endian and fixed
-width** — one, two, four or eight bytes, chosen by the format byte in
-front of them — and are not variable-length quantities at all.  Two
-copies of an encoding are two things to keep in step; so are two
-encodings called by the same name, and this one is a different encoding.
-
-## The reference implementation
-
-The MessagePack format specification (github.com/msgpack/msgpack,
-revision 2, 2017-08-09) and `msgpack-python` / `rmp` as the
-implementations to check against.  Every vector in
-`tests/msgpack_tests.nv` is from the specification's format table, its
-worked examples or its timestamp section, so a reader can check the port
-against the specification rather than against this package.
-
-## Status
-
-| function | implemented |
+| Item | Implemented |
 | --- | --- |
 | `mpack.type_name`, `.format_byte`, `.default_depth_limit` | no |
 | `mpack.as_int`, `.as_bool`, `.as_float`, `.as_str`, `.as_bytes` | no |
@@ -203,3 +244,9 @@ against the specification rather than against this package.
 | `MsgWriter`'s `Serializer` methods | no |
 | `MsgReader`'s `Deserializer` methods | no |
 | `mpackserde.to_bytes`, `.from_bytes` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
