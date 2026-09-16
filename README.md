@@ -155,7 +155,8 @@ where the next one starts.
 
 - **A build for a microcontroller.** The surface speaks `Bytes`, `Str`
   and `Result`, none of which links on a device today, so this package
-  makes no device claim and carries no probe.
+  does not build for a microcontroller with no heap allocator and
+  carries no probe program.
   [cbor-nv](https://novo-lang.org/packages/cbor-nv) is the format with a
   device half.
 - **Unsigned integers above 2^63 through the trait bridge.** The
