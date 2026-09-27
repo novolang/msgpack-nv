@@ -1,13 +1,7 @@
 // tests/msgpack_tests.nv — the API tests, written against the
 // signatures.
 //
-// They COMPILE today and they FAIL at run, with `not implemented:
-// mpack.<fn>` from the `todo()` that is each body.  That is the
-// expected state of an interface release: the compiler has checked
-// every signature, every type and every effect row, and nothing else
-// has been checked because there is nothing else yet.
-//
-// EVERY VECTOR IS THE SPECIFICATION'S.  The MessagePack format
+// Every vector is the specification's.  The MessagePack format
 // specification (github.com/msgpack/msgpack, revision 2, 2017-08-09)
 // gives the format table, the worked examples in its "Formats" section,
 // and the timestamp extension's three widths.  A test that passes here
@@ -24,6 +18,23 @@ use mpackserde
 // specification's format table.
 fn hex(s: Str) -> Bytes
     bytes.from_hex(s) ?? bytes.zeros(0)
+
+// A decoded integer, float or string, or a value no test expects when
+// the accessor refused.
+fn int_or(r: Result<Int, MsgError>) -> Int
+    match r
+        Ok(n)  => n
+        Err(_) => -999
+
+fn float_or(r: Result<Float, MsgError>) -> Float
+    match r
+        Ok(f)  => f
+        Err(_) => -999.0
+
+fn str_or(r: Result<Str, MsgError>) -> Str
+    match r
+        Ok(t)  => t
+        Err(_) => "refused"
 
 // ── The format table, one family at a time ──────────────────────────
 
@@ -59,19 +70,19 @@ fn test_every_integer_format_decodes_to_the_same_number()
     // A writer picks the shortest; a reader takes them all.  These are
     // five spellings of 1.
     match mpack.decode(hex("01"))
-        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Ok(v)  => test.assert_eq(int_or(mpack.as_int(v)), 1)
         Err(e) => test.fail(e.message())
     match mpack.decode(hex("cc01"))
-        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Ok(v)  => test.assert_eq(int_or(mpack.as_int(v)), 1)
         Err(e) => test.fail(e.message())
     match mpack.decode(hex("cd0001"))
-        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Ok(v)  => test.assert_eq(int_or(mpack.as_int(v)), 1)
         Err(e) => test.fail(e.message())
     match mpack.decode(hex("ce00000001"))
-        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Ok(v)  => test.assert_eq(int_or(mpack.as_int(v)), 1)
         Err(e) => test.fail(e.message())
     match mpack.decode(hex("d001"))
-        Ok(v)  => test.assert_eq(mpack.as_int(v) ?? 0, 1)
+        Ok(v)  => test.assert_eq(int_or(mpack.as_int(v)), 1)
         Err(e) => test.fail(e.message())
 
 @test
@@ -106,7 +117,7 @@ fn test_the_two_float_widths_stay_apart()
         Err(e) => test.fail(e.message())
     // Both read through `as_float`, for a caller that does not care.
     match mpack.decode(hex("cb3fe0000000000000"))
-        Ok(v)  => test.assert_eq(mpack.as_float(v) ?? 0.0, 0.5)
+        Ok(v)  => test.assert_eq(float_or(mpack.as_float(v)), 0.5)
         Err(e) => test.fail(e.message())
 
 @test
@@ -115,7 +126,7 @@ fn test_a_string_is_a_length_and_then_utf8()
     test.assert_eq(bytes.to_hex(mpack.encode(MsgStr("a"))), "a161")
     test.assert_eq(bytes.to_hex(mpack.encode(MsgStr(""))), "a0")
     match mpack.decode(hex("a3666f6f"))
-        Ok(v)  => test.assert_eq(mpack.as_str(v) ?? "", "foo")
+        Ok(v)  => test.assert_eq(str_or(mpack.as_str(v)), "foo")
         Err(e) => test.fail(e.message())
 
 @test
@@ -155,7 +166,7 @@ fn test_a_map_is_a_count_and_then_alternating_keys_and_values()
         Err(e) => test.fail(e.message())
         Ok(v)  =>
             match mpack.get(v, "a")
-                Ok(got) => test.assert_eq(mpack.as_int(got) ?? 0, 1)
+                Ok(got) => test.assert_eq(int_or(mpack.as_int(got)), 1)
                 Err(e2) => test.fail(e2.message())
 
 @test
@@ -184,7 +195,7 @@ fn test_duplicate_keys_survive_to_the_caller_and_the_first_one_wins()
                 Ok(entries) => test.assert_eq(list.len(entries), 2)
                 Err(e3)     => test.fail(e3.message())
             match mpack.get(v, "a")
-                Ok(got) => test.assert_eq(mpack.as_int(got) ?? 0, 1)
+                Ok(got) => test.assert_eq(int_or(mpack.as_int(got)), 1)
                 Err(e2) => test.fail(e2.message())
 
 @test

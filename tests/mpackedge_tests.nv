@@ -1,0 +1,440 @@
+// mpackedge_tests.nv — the wide forms of every family, every refusal
+// at the offset it names, the binary32 rounding, and the trait bridge
+// over nested types, optionals, enums and its own refusals.
+
+use std.test
+use std.list
+use std.bytes
+use mpack
+use mpackdec
+use mpackserde
+
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+// A decode's outcome as a short string: the family, or the refusal's
+// message.
+fn outcome(src: Bytes) -> Str
+    match mpack.decode(src)
+        Ok(v)  => mpack.type_name(v)
+        Err(e) => e.message()
+
+fn head_of(v: MsgValue) -> Str
+    bytes.to_hex(bytes.slice(mpack.encode(v), 0, 1))
+
+fn repeat_value(v: MsgValue, n: Int) -> [MsgValue]
+    list.map(list.range(0, n), i => v)
+
+@test
+fn test_the_wide_forms_of_every_family() [io]
+    let big = bytes.zeros(70000)
+    test.case("32-bit lengths for str, bin and ext, and counts for array and map")
+    test.assert_eq(head_of(MsgStr(str.repeat("a", 70000))), "db")
+    test.assert_eq(head_of(MsgBin(big)), "c6")
+    test.assert_eq(head_of(MsgExt(5, big)), "c9")
+    test.assert_eq(head_of(MsgArray(repeat_value(MsgNil, 70000))), "dd")
+    test.assert_eq(head_of(MsgMap(list.map(list.range(0, 70000), i => MsgPair { key: MsgInt(i), value: MsgNil }))),
+        "df")
+    test.assert_eq(mpack.encoded_len(MsgStr(str.repeat("a", 70000))), 70005)
+    test.assert_eq(mpack.encoded_len(MsgBin(big)), 70005)
+    test.assert_eq(mpack.encoded_len(MsgExt(5, big)), 70006)
+    test.assert_eq(mpack.encoded_len(MsgArray(repeat_value(MsgNil, 70000))), 70005)
+    test.case("16-bit lengths")
+    test.assert_eq(head_of(MsgExt(5, bytes.zeros(300))), "c8")
+    test.assert_eq(head_of(MsgBin(bytes.zeros(300))), "c5")
+    test.assert_eq(head_of(MsgArray(repeat_value(MsgNil, 16))), "dc")
+    test.assert_eq(head_of(MsgStr(str.repeat("a", 300))), "da")
+    test.case("the 32-bit forms read back")
+    test.assert_eq(outcome(hex("db00000003666f6f")), "str")
+    test.assert_eq(outcome(hex("c600000001ff")), "bin")
+    test.assert_eq(outcome(hex("c90000000105ff")), "ext")
+    test.assert_eq(outcome(hex("dd00000001c0")), "array")
+    test.assert_eq(outcome(hex("df00000001c0c0")), "map")
+    test.case("an unsigned value that fits an Int is an int, and MsgUint of one writes as one")
+    test.assert_eq(outcome(hex("cf0000000000000001")), "int")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgUint(5))), "05")
+    test.assert_eq(mpack.encoded_len(MsgUint(5)), 1)
+    test.assert_eq(mpack.encoded_len(MsgUint(-1)), 9)
+    test.case("every integer width, both signs")
+    let ints = [(-33, "d0df"), (-129, "d1ff7f"), (-32769, "d2ffff7fff"), (-2147483649, "d3ffffffff7fffffff"),
+                (65536, "ce00010000"), (4294967296, "cf0000000100000000")]
+    for pair in ints
+        let (n, want) = pair
+        test.assert_eq(bytes.to_hex(mpack.encode(MsgInt(n))), want)
+        test.assert_eq(mpack.encoded_len(MsgInt(n)), bytes.len(hex(want)))
+    test.case("the first byte of each value, containers included")
+    test.assert_eq(mpack.format_byte(MsgArray([MsgInt(1)])), 0x91)
+    test.assert_eq(mpack.format_byte(MsgMap([])), 0x80)
+    test.assert_eq(mpack.format_byte(MsgBool(true)), 0xC3)
+
+@test
+fn test_binary32_rounds_to_nearest_even() [io]
+    // 0.1 is 0x3dcccccd in binary32: the dropped bits are above half,
+    // so the last digit rounds up.
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat32(0.1))), "ca3dcccccd")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat32(1.0e300))), "ca7f800000")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat32(-1.0e300))), "caff800000")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat32(1.0e-50))), "ca00000000")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat32(1.0e-40))), "ca000116c2")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat32(math.nan()))), "ca7fc00000")
+    test.assert_eq(bytes.to_hex(mpack.encode(MsgFloat32(math.infinity()))), "ca7f800000")
+    test.case("and reads back exactly, subnormals and infinities included")
+    match mpack.decode(hex("ca000116c2"))
+        Ok(v)  => test.assert(bytes.to_hex(mpack.encode(v)) == "ca000116c2")
+        Err(e) => test.fail(e.message())
+    match mpack.decode(hex("caff800000"))
+        Ok(MsgFloat32(f)) => test.assert(f < -1.0e308)
+        _                 => test.fail("negative infinity")
+
+@test
+fn test_the_accessors_refuse_the_wrong_family() [io]
+    let values = [MsgNil, MsgBool(true), MsgInt(1), MsgUint(-1), MsgFloat32(0.5), MsgFloat64(0.5),
+                  MsgStr("s"), MsgBin(hex("00")), MsgArray([]), MsgMap([]), MsgExt(1, hex("00"))]
+    let names = ["nil", "bool", "int", "uint", "float32", "float64", "str", "bin", "array", "map", "ext"]
+    for i in 0..list.len(values)
+        test.assert_eq(mpack.type_name(values[i]), names[i])
+    test.assert(refused_int(mpack.as_int(MsgNil)))
+    test.assert(refused_bool(mpack.as_bool(MsgNil)))
+    test.assert(refused_float(mpack.as_float(MsgNil)))
+    test.assert(refused_str(mpack.as_str(MsgBin(hex("61")))))
+    test.assert(refused_bin(mpack.as_bytes(MsgStr("a"))))
+    test.assert(refused_array(mpack.as_array(MsgNil)))
+    test.assert(refused_map(mpack.as_map(MsgNil)))
+    test.assert(refused_value(mpack.get(MsgNil, "a")))
+    test.assert(refused_value(mpack.get(MsgMap([MsgPair { key: MsgInt(1), value: MsgNil }]), "a")))
+    test.case("and answer the right one")
+    match mpack.as_float(MsgFloat32(0.5))
+        Ok(f)  => test.assert(f == 0.5)
+        Err(e) => test.fail(e.message())
+    match mpack.as_bytes(MsgBin(hex("0102")))
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "0102")
+        Err(e) => test.fail(e.message())
+    match mpack.as_array(MsgArray([MsgNil]))
+        Ok(xs) => test.assert_eq(list.len(xs), 1)
+        Err(e) => test.fail(e.message())
+    match mpack.as_map(MsgMap([MsgPair { key: MsgNil, value: MsgNil }]))
+        Ok(es) => test.assert_eq(list.len(es), 1)
+        Err(e) => test.fail(e.message())
+    test.case("every refusal has a message")
+    test.assert(says(MsgTruncated(1, 2), "needs 2 more"))
+    test.assert(says(MsgReservedFormat(0, 0xC1), "reserved"))
+    test.assert(says(MsgBadUtf8(3), "not UTF-8"))
+    test.assert(says(MsgDepthExceeded(4, 64), "limit of 64"))
+    test.assert(says(MsgTrailingBytes(5, 6), "6 bytes follow"))
+    test.assert(says(MsgUnexpectedType(-1, "int", "nil"), "found nil"))
+    test.assert(says(MsgUnexpectedType(7, "int", "nil"), "offset 7"))
+    test.assert(says(MsgBadTimestamp(-1, 3), "3 bytes"))
+    test.assert(says(MsgBufferTooSmall(3, 2), "has 2"))
+
+// Whether a refusal's message contains `part`.
+fn says(e: MsgError, part: Str) -> Bool
+    let m = e.message()
+    str.starts_with(m, "msgpack: ") and str.contains(m, part)
+
+fn refused_int(r: Result<Int, MsgError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn refused_bool(r: Result<Bool, MsgError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn refused_float(r: Result<Float, MsgError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn refused_str(r: Result<Str, MsgError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn refused_bin(r: Result<Bytes, MsgError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn refused_array(r: Result<[MsgValue], MsgError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn refused_map(r: Result<[MsgPair], MsgError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn refused_value(r: Result<MsgValue, MsgError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn stamp(t: MsgTimestamp) -> Str
+    match mpack.timestamp_of(mpack.timestamp_value(t))
+        Ok(back) => "${back.seconds}.${back.nanos}"
+        Err(e)   => e.message()
+
+@test
+fn test_the_three_timestamp_widths_and_their_refusals() [io]
+    test.assert_eq(stamp(MsgTimestamp { seconds: -5, nanos: 7 }), "-5.7")
+    test.assert_eq(bytes.len(mpack.encode(mpack.timestamp_value(MsgTimestamp { seconds: -5, nanos: 7 }))), 15)
+    test.assert_eq(stamp(MsgTimestamp { seconds: 17179869184, nanos: 0 }), "17179869184.0")
+    test.assert_eq(mpack.type_name(mpack.timestamp_value(MsgTimestamp { seconds: 1, nanos: 1000000000 })), "nil")
+    test.case("a nanoseconds field past 999999999 in either wide form")
+    test.assert(str.contains(stamp_raw(MsgExt(-1, hex("ffffffff00000001"))), "8 bytes"))
+    test.assert(str.contains(stamp_raw(MsgExt(-1, hex("ffffffff0000000000000001"))), "12 bytes"))
+    test.assert(str.contains(stamp_raw(MsgNil), "wanted timestamp"))
+
+fn stamp_raw(v: MsgValue) -> Str
+    match mpack.timestamp_of(v)
+        Ok(t)  => "${t.seconds}"
+        Err(e) => e.message()
+
+@test
+fn test_every_refusal_names_its_offset() [io]
+    test.case("a header cut short, and each body cut short")
+    test.assert_eq(outcome(hex("")), "msgpack: the value at offset 0 needs 1 more bytes")
+    test.assert(str.contains(outcome(hex("d9")), "needs 1 more"))
+    test.assert(str.contains(outcome(hex("a3666f")), "needs 1 more"))
+    test.assert(str.contains(outcome(hex("c40301")), "needs 2 more"))
+    test.assert(str.contains(outcome(hex("d4")), "needs 2 more"))
+    test.assert(str.contains(outcome(hex("cb00")), "needs 7 more"))
+    test.case("a map whose key or value is cut off")
+    test.assert(str.contains(outcome(hex("81")), "offset 1"))
+    test.assert(str.contains(outcome(hex("81c0")), "offset 2"))
+    test.case("UTF-8 cut short, with a bad continuation, overlong, a surrogate and past U+10FFFF")
+    test.assert(str.contains(outcome(hex("a2e282")), "offset 1"))
+    test.assert(str.contains(outcome(hex("a3e228a1")), "offset 1"))
+    test.assert(str.contains(outcome(hex("a2c0af")), "offset 1"))
+    test.assert(str.contains(outcome(hex("a3eda080")), "offset 1"))
+    test.assert(str.contains(outcome(hex("a4f4908080")), "offset 1"))
+    test.assert(str.contains(outcome(hex("a1e9")), "offset 1"))
+    test.assert(str.contains(outcome(hex("a3e28228")), "offset 1"))
+    test.assert_eq(outcome(hex("a4f09f9880")), "str")
+    test.case("nesting past the limit inside a map")
+    let deep = hex(str.repeat("81", 70) + "c0c0")
+    test.assert(str.contains(outcome(deep), "limit of 64"))
+    match mpack.decode_prefix_limited(hex("81c081c0c0"), 1)
+        Ok(_)  => test.fail("a map inside a map is two levels")
+        Err(e) => test.assert(str.contains(e.message(), "limit of 1"))
+
+@test
+fn test_the_stream_moves_offsets_to_the_stream() [io]
+    match mpackdec.feed(mpackdec.decoder(), hex("c0c1"))
+        Ok(_)  => test.fail("0xc1 is reserved")
+        Err(e) => test.assert_eq(e.message(), "msgpack: format byte 193 at offset 1 is reserved")
+    match mpackdec.feed(mpackdec.decoder(), hex("c0a1ff"))
+        Ok(_)  => test.fail("0xff is not UTF-8")
+        Err(e) => test.assert_eq(e.message(), "msgpack: the str at offset 2 is not UTF-8")
+    match mpackdec.feed(mpackdec.decoder(), hex("c0cd00"))
+        Err(e) => test.fail(e.message())
+        Ok(f)  =>
+            match mpackdec.finish(f.decoder)
+                Ok(_)  => test.fail("a uint 16 is three bytes")
+                Err(e) => test.assert_eq(e.message(), "msgpack: the value at offset 1 needs 1 more bytes")
+
+// ── The trait bridge ────────────────────────────────────────────────
+
+struct Inner
+    name: Str
+    tags: [Str]
+
+struct Outer
+    id: Int
+    ok: Bool
+    ratio: Float
+    inner: Inner
+    note: ?Str
+    rows: [Int]
+
+enum Shape
+    Dot
+    Circle(radius: Float)
+    Rect(w: Int, h: Int)
+
+struct Drawing
+    shapes: [Shape]
+
+struct Chain
+    next: [Chain]
+
+struct Wide
+    a1: Int
+    a2: Int
+    a3: Int
+    a4: Int
+    a5: Int
+    a6: Int
+    a7: Int
+    a8: Int
+    a9: Int
+    a10: Int
+    a11: Int
+    a12: Int
+    a13: Int
+    a14: Int
+    a15: Int
+    a16: Int
+
+fn chain(n: Int) -> Chain
+    if n == 0
+        return Chain { next: [] }
+    Chain { next: [chain(n - 1)] }
+
+@test
+fn test_a_nested_value_round_trips_through_the_traits() [io]
+    let v = Outer { id: -300,
+        ok: true,
+        ratio: 0.25,
+        inner: Inner { name: "é", tags: ["a", "b"] },
+        note: None,
+        rows: list.range(0, 20) }
+    match mpackserde.to_bytes(v)
+        Err(e) => test.fail(e.message())
+        Ok(b)  =>
+            let r: Result<Outer, DeserializeError> = mpackserde.from_bytes(b)
+            match r
+                Err(e) => test.fail(e.message())
+                Ok(x)  =>
+                    test.assert_eq(x.id, -300)
+                    test.assert(x.ok and x.ratio == 0.25)
+                    test.assert_eq(x.inner.name, "é")
+                    test.assert(x.inner.tags == ["a", "b"])
+                    test.assert(x.note == None)
+                    test.assert_eq(list.len(x.rows), 20)
+    test.case("a present optional is its value")
+    let with_note = Outer { id: 1,
+        ok: false,
+        ratio: 1.0,
+        inner: Inner { name: "", tags: [] },
+        note: Some("n"),
+        rows: [] }
+    match mpackserde.to_bytes(with_note)
+        Err(e) => test.fail(e.message())
+        Ok(b)  =>
+            let r: Result<Outer, DeserializeError> = mpackserde.from_bytes(b)
+            match r
+                Ok(x)  => test.assert(x.note == Some("n"))
+                Err(e) => test.fail(e.message())
+
+@test
+fn test_enums_and_wide_structs_round_trip() [io]
+    let d = Drawing { shapes: [Dot, Circle(1.5), Rect(2, 3)] }
+    match mpackserde.to_bytes(d)
+        Err(e) => test.fail(e.message())
+        Ok(b)  =>
+            let r: Result<Drawing, DeserializeError> = mpackserde.from_bytes(b)
+            match r
+                Err(e) => test.fail(e.message())
+                Ok(x)  => test.assert_eq(list.len(x.shapes), 3)
+    let w = Wide { a1: 1,
+        a2: 2,
+        a3: 3,
+        a4: 4,
+        a5: 5,
+        a6: 6,
+        a7: 7,
+        a8: 8,
+        a9: 9,
+        a10: 10,
+        a11: 11,
+        a12: 12,
+        a13: 13,
+        a14: 14,
+        a15: 15,
+        a16: 16 }
+    match mpackserde.to_bytes(w)
+        Err(e) => test.fail(e.message())
+        Ok(b)  =>
+            test.assert_eq(bytes.to_hex(bytes.slice(b, 0, 3)), "de0010")
+            let r: Result<Wide, DeserializeError> = mpackserde.from_bytes(b)
+            match r
+                Ok(x)  => test.assert_eq(x.a16, 16)
+                Err(e) => test.fail(e.message())
+
+@test
+fn test_the_bridge_refuses_what_it_cannot_read() [io]
+    test.case("a type nested past the limit is refused on the way out")
+    match mpackserde.to_bytes(chain(70))
+        Ok(_)  => test.fail("seventy levels is past the limit")
+        Err(e) => test.assert(str.contains(e.message(), "limit of 64"))
+    test.case("a missing member, and members of the wrong family")
+    let missing: Result<Inner, DeserializeError> = mpackserde.from_bytes(hex("81a46e616d65a0"))
+    test.assert(str.contains(fault(missing), "no member named tags"))
+    let wrong: Result<Outer, DeserializeError> = mpackserde.from_bytes(mpack.encode(MsgMap([
+        MsgPair { key: MsgStr("id"), value: MsgStr("x") }])))
+    test.assert(str.contains(fault(wrong), "expected an integer"))
+    test.case("each getter refuses the wrong family")
+    let r = mpackserde.reader(hex("c0"))
+    test.assert(r.is_null())
+    test.assert(str.contains(bool_fault(r.get_bool()), "expected a bool"))
+    test.assert(str.contains(int_fault(r.get_int()), "expected an integer"))
+    test.assert(str.contains(float_fault(r.get_float()), "expected a float"))
+    test.assert(str.contains(str_fault(r.get_str()), "expected a str"))
+    test.assert(str.contains(int_fault(r.seq_len()), "expected an array"))
+    test.assert(str.contains(reader_fault(r.seq_at(0)), "expected an array"))
+    test.assert(str.contains(int_fault(mpackserde.reader(hex("cfffffffffffffffff")).get_int()), "above 2^63"))
+    match mpackserde.reader(hex("ca3f000000")).get_float()
+        Ok(f)  => test.assert(f == 0.5)
+        Err(e) => test.fail(e.message())
+    test.assert_eq(r.fail("custom").reason, "custom")
+    test.case("an element past the end, a 16-bit array, and an optional that is nil")
+    let arr = mpackserde.reader(mpack.encode(MsgArray(repeat_value(MsgInt(7), 20))))
+    test.assert(str.contains(reader_fault(arr.seq_at(20)), "no element 20 of 20"))
+    match arr.seq_at(19)
+        Ok(x)  => test.assert(bool_or(x.get_int()))
+        Err(e) => test.fail(e.message())
+    let arr32 = mpackserde.reader(hex("dd000000020102"))
+    match arr32.seq_len()
+        Ok(n)  => test.assert_eq(n, 2)
+        Err(e) => test.fail(e.message())
+    let m = mpackserde.reader(mpack.encode(MsgMap([MsgPair { key: MsgStr("a"), value: MsgNil },
+                                                   MsgPair { key: MsgInt(1), value: MsgInt(2) },
+                                                   MsgPair { key: MsgStr("b"), value: MsgInt(3) }])))
+    test.assert(m.opt_field("a") == None)
+    test.assert(m.opt_field("z") == None)
+    test.assert(m.opt_field("b") != None)
+    test.assert(m.keys() == ["a", "b"])
+    let wide_map = mpackserde.reader(hex("de0001a161c3"))
+    test.assert(wide_map.keys() == ["a"])
+    let map32 = mpackserde.reader(hex("df00000001a161c3"))
+    test.assert(map32.keys() == ["a"])
+    test.assert(mpackserde.reader(hex("c0")).keys() == [])
+    test.case("a reader past the end of a truncated document finds nothing")
+    let cut = mpackserde.reader(hex("82a161"))
+    test.assert(cut.opt_field("b") == None)
+    let broken = mpackserde.reader(hex("82a161c1a162c3"))
+    test.assert(broken.opt_field("b") == None)
+    test.assert(str.contains(str_fault(mpackserde.reader(hex("a1ff")).get_str()), "expected a str"))
+    test.case("a sequence past 65535 elements takes the 32-bit header")
+    let long = Drawing { shapes: list.map(list.range(0, 70000), i => Dot) }
+    match mpackserde.to_bytes(long)
+        Ok(b)  => test.assert_eq(bytes.to_hex(bytes.slice(b, 0, 9)), "81a6736861706573dd")
+        Err(e) => test.fail(e.message())
+
+fn bool_or(r: Result<Int, DeserializeError>) -> Bool
+    match r
+        Ok(n)  => n == 7
+        Err(_) => false
+
+fn fault<T>(r: Result<T, DeserializeError>) -> Str
+    match r
+        Ok(_)  => "accepted"
+        Err(e) => e.path + ": " + e.reason
+
+fn bool_fault(r: Result<Bool, DeserializeError>) -> Str
+    fault(r)
+
+fn int_fault(r: Result<Int, DeserializeError>) -> Str
+    fault(r)
+
+fn float_fault(r: Result<Float, DeserializeError>) -> Str
+    fault(r)
+
+fn str_fault(r: Result<Str, DeserializeError>) -> Str
+    fault(r)
+
+fn reader_fault(r: Result<MsgReader, DeserializeError>) -> Str
+    fault(r)
