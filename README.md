@@ -8,12 +8,6 @@ four bytes rather than seven. The format is defined by the
 [MessagePack specification](https://github.com/msgpack/msgpack/blob/master/spec.md),
 revision 2 of 9 August 2017. This package implements all of it.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What MessagePack is
 
 A document is one value. A value is a format byte and then, for the
@@ -74,10 +68,7 @@ fn main() [io]
     println(bytes.to_hex(mpack.encode(doc)))
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented: mpack.<fn>`
-panic. The tests are the specification the implementation will have to
-satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -131,7 +122,8 @@ where the next one starts.
    for a hundred thousand levels of recursion. Past the limit is
    `MsgDepthExceeded`. `mpackdec.with_depth_limit` raises or lowers it,
    and the limit travels on the decoder so that two decoders in one
-   program may differ.
+   program may differ. `mpack.decode_prefix_limited` takes a limit for
+   one call.
 7. **`mpack.decode` refuses trailing bytes.** One buffer, one document.
    A caller reading several uses `decode_prefix` or `mpackdec`.
 8. **`0xc1` is not MessagePack.** The specification reserves that byte
@@ -150,6 +142,13 @@ where the next one starts.
     member name.** Not an array of members in declaration order. The
     array form is half the size, and the traits give a reader no way to
     know which convention the writer used.
+13. **`float 32` is converted in integer arithmetic.** The standard
+    library has no binary32 conversion, so `MsgFloat32` is written as
+    the binary32 value nearest the `Float`, ties to even, and read back
+    exactly.
+14. **The stream decoder reads a held value again on each chunk.** A
+    value arriving in many small chunks costs time in proportion to its
+    size times the number of chunks.
 
 ## What is not included
 
@@ -204,47 +203,35 @@ where the next one starts.
 ## Tests
 
 ```bash
-novo test tests/msgpack_tests.nv      # 35 tests
+novo test tests/msgpack_tests.nv        # the format table, the stream, the trait bridge
+novo test tests/differential_tests.nv   # 200 documents msgpack-python packed
+novo test tests/mpackedge_tests.nv      # the wide forms, every refusal, binary32, nested types
+bash tests/coverage.sh                  # line coverage over src/, merged across the suites
 ```
 
-Every vector is from the specification's format table, its worked
-examples or its timestamp section. The implementations to check a port
-against are `msgpack-python` and the `rmp` crate in Rust.
+The suites check these things:
 
-The suite asserts that nil and the booleans are one byte each, that an
-integer takes the shortest format that holds it and that every format
-decodes to the same number, that an unsigned value above 2^63 is its own
-case, that the two float widths stay apart, that bytes are their own
-family, that a map key is any value, that duplicate keys survive to the
-caller with the first one winning, that the timestamp extension is type
--1 and picks its width, that the reserved format byte is refused, that a
-truncation names what it still needed, that nesting past the limit is
-refused rather than recursed, that a value split across chunks finishes
-on the chunk that completes it, that one chunk carrying several messages
-drains them all, and that a struct writes itself as a map and reads
-itself back.
-
-The tests compile today and fail at run, each on the `not implemented`
-panic that is its body. That is the expected state of an interface
-release. They turn green one at a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `mpack.type_name`, `.format_byte`, `.default_depth_limit` | no |
-| `mpack.as_int`, `.as_bool`, `.as_float`, `.as_str`, `.as_bytes` | no |
-| `mpack.as_array`, `.as_map`, `.get` | no |
-| `mpack.timestamp_type`, `.timestamp_value`, `.timestamp_of` | no |
-| `mpack.encoded_len`, `.encode`, `.encode_into` | no |
-| `mpack.decode`, `.decode_prefix` | no |
-| `mpack.MsgError.message` | no |
-| `mpackdec.decoder`, `.with_depth_limit`, `.pending`, `.stream_at` | no |
-| `mpackdec.feed`, `.finish` | no |
-| `mpackserde.writer`, `.writer_bytes`, `.reader`, `.reader_at` | no |
-| `MsgWriter`'s `Serializer` methods | no |
-| `MsgReader`'s `Deserializer` methods | no |
-| `mpackserde.to_bytes`, `.from_bytes` | no |
+- The specification's format table one family at a time: nil and the
+  booleans are one byte each, an integer takes the shortest format and
+  every format decodes to the same number, an unsigned value above 2^63
+  is its own case, the two float widths stay apart, bytes are their own
+  family, a map key is any value, and the first of two duplicate keys
+  wins.
+- The timestamp extension in all three widths, and its refusals.
+- 200 seeded documents packed by
+  [msgpack-python](https://github.com/msgpack/msgpack-python) decode to
+  the value it packed and encode back to the same bytes, which means the
+  two agree on the shortest form of every value.
+  `tools/differential.py` writes that suite.
+- The 16- and 32-bit forms of every family, binary32 rounding to
+  nearest even, subnormals and infinities, and every refusal at the
+  offset it names.
+- A stream split across chunks finishes on the chunk that completes it,
+  one chunk carrying several messages drains them all, and a peer
+  hanging up is reported only by `finish`.
+- A nested struct with a list, an optional and an enum writes itself as
+  a map and reads itself back, and a type nested past the limit is
+  refused on the way out.
 
 ## Licence
 

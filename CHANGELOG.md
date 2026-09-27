@@ -4,6 +4,31 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.0 — 2026-09-27
+
+The first implementation of the interface published as 0.0.2.
+
+- `mpack` writes every value in its shortest form into a buffer of the
+  exact length, and reads every format family, with UTF-8 checked, the
+  nesting limit enforced before a level is read, and every refusal at
+  its offset. It agrees with msgpack-python on 200 seeded documents,
+  both ways.
+- `float 32` is converted from the binary64 bit pattern in integer
+  arithmetic, rounding to nearest with ties to even.
+- `mpack.decode_prefix_limited`, `decode_prefix` with a nesting limit
+  of the caller's, which `mpackdec` reads each value through.
+- `mpackdec` holds the bytes that did not finish a value and decodes
+  from the start of them on each chunk.
+- `mpackserde` writes a struct as a map keyed by member name and reads
+  it back by scanning the map for each key. `begin_variant` writes
+  nothing: the standard library's walk writes the externally tagged map
+  itself. `to_bytes` refuses a document nested past the default limit by
+  reading it back.
+- `MsgDepthExceeded` carries the limit it passed. An accessor's and
+  `timestamp_of`'s refusals carry the offset -1, since they read a value
+  rather than bytes.
+- The toolchain floor is 0.13.0.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
