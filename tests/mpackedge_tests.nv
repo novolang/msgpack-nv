@@ -213,6 +213,7 @@ fn test_every_refusal_names_its_offset() [io]
     test.assert(str.contains(outcome(hex("a1e9")), "offset 1"))
     test.assert(str.contains(outcome(hex("a3e28228")), "offset 1"))
     test.assert_eq(outcome(hex("a4f09f9880")), "str")
+    test.assert_eq(outcome(hex("a3e0a080")), "str")
     test.case("nesting past the limit inside a map")
     let deep = hex(str.repeat("81", 70) + "c0c0")
     test.assert(str.contains(outcome(deep), "limit of 64"))
