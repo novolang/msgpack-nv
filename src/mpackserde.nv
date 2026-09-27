@@ -1,52 +1,41 @@
 // mpackserde — the bridge to the standard library's serialization
 // traits, so a novo-lang struct writes and reads itself as MessagePack.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// Both halves can be written, because MessagePack is self-describing.
+// A reader's `field` scans the map at its own offset for the key and
+// answers a reader at the value, so the parent never has to be
+// advanced.  `nil` is a format byte of its own, so `None` is
+// `put_null` and `Some(x)` is `x`, and the two are already different
+// documents.
 //
-// BOTH HALVES ARE WRITABLE TODAY, and that is worth stating because the
-// package next to this one — postcard-nv — publishes a read half that
-// is not.  The difference is entirely that MessagePack is
-// self-describing.
+// Where it is short of the format, the value tree in `mpack` is the
+// answer: the trait has one integer hook, so `uint 64` above 2^63 is
+// unreachable; one float hook, so everything goes out as `float 64`; no
+// bytes hook, so the `bin` family is unreachable; and no way to open a
+// map whose keys are not strings.
 //
-//   * postcard's `Deserializer` cannot be written because `field(self,
-//     name)` answers a CHILD cursor and leaves the parent unchanged,
-//     and a nameless format's member 2 begins wherever member 1 ended —
-//     which the parent has no way to learn.  MessagePack writes a key
-//     in front of every member, so `field("beta")` SCANS the map at the
-//     parent's own offset and needs no threading at all.  The parent is
-//     never advanced because it never has to be.
-//   * postcard cannot write a `Some` because the trait announces `None`
-//     (as `put_null`) and announces `Some` not at all, so a present
-//     optional reaches the format as a bare value with no discriminant
-//     in front of it.  MessagePack needs no discriminant: `nil` is
-//     `0xc0` and is distinguishable from every other value by its own
-//     format byte, so `None` is `put_null` and `Some(x)` is `x`, and the
-//     two are already different documents.
-//
-// WHERE IT IS STILL SHORT OF THE FORMAT is real but narrower, and every
-// case has the value tree in `mpack` as its answer.  The README has the
-// list; the four headlines are that the trait has ONE integer hook (so
-// `uint 64` above 2^63 is unreachable), ONE float hook (so everything
-// goes out as `float 64`), NO bytes hook (so the whole `bin` family is
-// unreachable), and no way to open a map whose keys are not strings.
+// The writer builds its document as a list of byte values.  Each
+// method answers a new writer holding the old list and what it wrote,
+// because a `Serializer` is threaded rather than written in place.
+
+use mpack
 
 // A MessagePack document being built.
 //
-// `out` accumulates byte values because a `Serializer` is THREADED
+// `out` accumulates byte values because a `Serializer` is threaded
 // rather than mutated — every method takes the writer and returns it —
 // and because the runtime's `Bytes` cannot be appended to element by
 // element.  A caller who needs the finished bytes calls `writer_bytes`.
 //
-// `depth` is carried so that a type nested past the decoder's limit is
-// refused on the way OUT as well as on the way in; a writer that
-// happily produced a document nothing can read would be a strange
-// thing to have.
+// `depth` is how many structs and sequences are open.  A type nested
+// past the decoder's limit is refused by `to_bytes`, which reads its
+// own document back with the decoder's limit, so the writer never
+// answers a document nothing can read.
 pub struct MsgWriter
     out: [Int]
     depth: Int
 
-// A cursor into a MessagePack document: an OFFSET, not a parsed tree.
+// A cursor into a MessagePack document: an offset, not a parsed tree.
 //
 // `at` is the byte the next read starts at and `path` is the route from
 // the document's root, which `DeserializeError` needs.  Unlike a
@@ -64,7 +53,7 @@ pub struct MsgReader
 
 // A fresh writer with nothing in it.
 pub fn writer() -> MsgWriter
-    todo("mpackserde.writer")
+    MsgWriter { out: [], depth: 0 }
 
 // The bytes a writer accumulated.
 //
@@ -73,11 +62,11 @@ pub fn writer() -> MsgWriter
 // `writer_bytes` and the reason this one answers `Bytes` rather than a
 // `Result`.
 pub fn writer_bytes(w: MsgWriter) -> Bytes
-    todo("mpackserde.writer_bytes")
+    bytes.from_byte_list(w.out)
 
 // A fresh reader over `src`, positioned at the document's root.
 pub fn reader(src: Bytes) -> MsgReader
-    todo("mpackserde.reader")
+    MsgReader { src: src, at: 0, path: "$" }
 
 // The byte offset `r` reads from.
 //
@@ -85,7 +74,7 @@ pub fn reader(src: Bytes) -> MsgReader
 // find the next one; a caller reading one document uses `mpack.decode`
 // and never needs it.
 pub fn reader_at(r: MsgReader) -> Int
-    todo("mpackserde.reader_at")
+    r.at
 
 // The format side, so a novo-lang struct or enum writes itself.
 //
@@ -96,7 +85,7 @@ pub fn reader_at(r: MsgReader) -> Int
 //
 // The alternative — a struct as an `array` of its members in
 // declaration order — is half the bytes and is what a schema-sharing
-// pair of novo-lang programs would rather have.  It is deliberately NOT
+// pair of novo-lang programs would rather have.  It is deliberately not
 // what this does: the trait gives `begin_struct` the member count but
 // gives the reader no way to know which convention the writer chose, so
 // a package that had both would produce documents that decode as the
@@ -106,20 +95,21 @@ impl Serializer for MsgWriter
     // `0xc0`.  The whole of MessagePack's optional handling on the
     // write side, because `Some(x)` is `x`.
     fn put_null(self) -> MsgWriter
-        todo("mpackserde.MsgWriter.put_null")
+        wrote(self, [0xC0])
 
     fn put_bool(self, v: Bool) -> MsgWriter
-        todo("mpackserde.MsgWriter.put_bool")
+        wrote(self, [(if v then 0xC3 else 0xC2)])
 
-    // The shortest signed format that holds `v`: a positive fixint for
-    // `0 ..= 127`, a negative fixint for `-32 ..= -1`, then `int 8`,
-    // `int 16`, `int 32`, `int 64`.
+    // The shortest format that holds `v`: a positive fixint for
+    // `0 ..= 127`, a negative fixint for `-32 ..= -1`, then `uint 8` to
+    // `uint 64` for a positive value and `int 8` to `int 64` for a
+    // negative one, as `mpack.encode` writes `MsgInt`.
     //
     // `uint 64` above 2^63 is unreachable from here — there is one
     // integer hook and novo-lang has one integer type — so a document
     // with such a value in it is built with `mpack`'s `MsgUint`.
     fn put_int(self, v: Int) -> MsgWriter
-        todo("mpackserde.MsgWriter.put_int")
+        wrote(self, encoded(MsgInt(v)))
 
     // `0xcb`, `float 64`, always.
     //
@@ -127,48 +117,49 @@ impl Serializer for MsgWriter
     // there is nothing here to decide with: a caller who wants the
     // four-byte `float 32` builds a `MsgFloat32` in `mpack`.
     fn put_float(self, v: Float) -> MsgWriter
-        todo("mpackserde.MsgWriter.put_float")
+        wrote(self, encoded(MsgFloat64(v)))
 
     // The shortest `str` format that holds `v`.
     //
-    // Note what is NOT here: a hook for `Bytes`.  The `bin` family is
+    // Note what is not here: a hook for `Bytes`.  The `bin` family is
     // unreachable through this trait, so a member that is really bytes
     // travels as a `str` of whatever the caller encoded it to — base64,
     // hex — or the document is built with `mpack`'s `MsgBin`.
     fn put_str(self, v: Str) -> MsgWriter
-        todo("mpackserde.MsgWriter.put_str")
+        wrote(self, encoded(MsgStr(v)))
 
     // The `map` header for `n` members.  `name` is not written: a
     // MessagePack map has no type tag, and a reader that wanted one
     // would be reading a different format.
     fn begin_struct(self, name: Str, n: Int) -> MsgWriter
-        todo("mpackserde.MsgWriter.begin_struct")
+        deeper(wrote(self, header(n, 0x80, 0xDE)), 1)
 
     // The member's name, as a `str` key.  The value the walk writes
     // next is the entry's value.
     fn field(self, name: Str) -> MsgWriter
-        todo("mpackserde.MsgWriter.field")
+        wrote(self, encoded(MsgStr(name)))
 
     // Nothing: the header already said how many entries there were, so
     // a MessagePack map has no terminator.
     fn end_struct(self) -> MsgWriter
-        todo("mpackserde.MsgWriter.end_struct")
+        deeper(self, -1)
 
     // The `array` header for `n` elements.
     fn begin_seq(self, n: Int) -> MsgWriter
-        todo("mpackserde.MsgWriter.begin_seq")
+        deeper(wrote(self, header(n, 0x90, 0xDC)), 1)
 
     // Nothing: elements are told apart by position, and the header
     // said how many there are.
     fn elem(self) -> MsgWriter
-        todo("mpackserde.MsgWriter.elem")
+        self
 
     fn end_seq(self) -> MsgWriter
-        todo("mpackserde.MsgWriter.end_seq")
+        deeper(self, -1)
 
-    // A one-entry `map` from the variant name to its payload — the
-    // externally tagged form, which is what the trait's own default
-    // pair produces and what the standard library's walk reads back.
+    // Nothing.  The standard library's walk writes an enum value as a
+    // one-entry `map` from the variant name to its payload, the
+    // externally tagged form, with the calls above, and reads it back
+    // the same way.
     //
     // `index` is ignored on purpose.  A variant index is two bytes
     // cheaper and is what postcard writes, and it is also what turns
@@ -176,10 +167,10 @@ impl Serializer for MsgWriter
     // break.  A self-describing format can afford the name, so it
     // spends it.
     fn begin_variant(self, enum_name: Str, variant: Str, index: Int, n: Int) -> MsgWriter
-        todo("mpackserde.MsgWriter.begin_variant")
+        self
 
     fn end_variant(self) -> MsgWriter
-        todo("mpackserde.MsgWriter.end_variant")
+        self
 
 // The cursor side, so a novo-lang struct or enum reads itself.
 //
@@ -197,7 +188,9 @@ impl Deserializer for MsgReader
     // the member counts a struct actually has, that is cheaper than the
     // index it would take to avoid it.
     fn field(self, name: Str) -> Result<MsgReader, DeserializeError>
-        todo("mpackserde.MsgReader.field")
+        match member_at(self.src, self.at, name)
+            Some(at) => Ok(MsgReader { src: self.src, at: at, path: self.path + "." + name })
+            None     => Err(DeserializeError { path: self.path, reason: "no member named ${name}" })
 
     // The member named `name` when it is present and not `nil`.
     //
@@ -206,7 +199,12 @@ impl Deserializer for MsgReader
     // and the one that lets a writer drop `None` members without
     // changing what a reader sees.
     fn opt_field(self, name: Str) -> ?MsgReader
-        todo("mpackserde.MsgReader.opt_field")
+        match member_at(self.src, self.at, name)
+            None     => None
+            Some(at) =>
+                if byte(self.src, at) == 0xC0
+                    return None
+                Some(MsgReader { src: self.src, at: at, path: self.path + "." + name })
 
     // The keys of the map at `at`, in document order.
     //
@@ -214,10 +212,20 @@ impl Deserializer for MsgReader
     // carries the names.  It is what the standard library's externally
     // tagged enum reader uses to find the variant name.
     fn keys(self) -> [Str]
-        todo("mpackserde.MsgReader.keys")
+        let count = map_count(self.src, self.at)
+        var out: [Str] = []
+        var at = map_body(self.src, self.at)
+        for _ in 0..count
+            if let Some(MsgStr(k)) = value_at(self.src, at)
+                list.push(out, k)
+            at = skip(self.src, skip(self.src, at))
+        out
 
     fn seq_len(self) -> Result<Int, DeserializeError>
-        todo("mpackserde.MsgReader.seq_len")
+        let tag = byte(self.src, self.at)
+        if tag >= 0x90 and tag <= 0x9F or tag == 0xDC or tag == 0xDD
+            return Ok(seq_count(self.src, self.at))
+        Err(DeserializeError { path: self.path, reason: "expected an array" })
 
     // Element `i`, found by skipping elements 0 through `i - 1`.
     //
@@ -226,14 +234,24 @@ impl Deserializer for MsgReader
     // difference is that skipping a MessagePack element needs only its
     // format byte, so the scan is a header walk rather than a decode.
     fn seq_at(self, i: Int) -> Result<MsgReader, DeserializeError>
-        todo("mpackserde.MsgReader.seq_at")
+        match self.seq_len()
+            Err(e) => Err(e)
+            Ok(n)  =>
+                if i < 0 or i >= n
+                    return Err(DeserializeError { path: self.path, reason: "no element ${i} of ${n}" })
+                var at = seq_body(self.src, self.at)
+                for _ in 0..i
+                    at = skip(self.src, at)
+                Ok(MsgReader { src: self.src, at: at, path: self.path + "[${i}]" })
 
     // Whether the value at `at` is `0xc0`.
     fn is_null(self) -> Bool
-        todo("mpackserde.MsgReader.is_null")
+        byte(self.src, self.at) == 0xC0
 
     fn get_bool(self) -> Result<Bool, DeserializeError>
-        todo("mpackserde.MsgReader.get_bool")
+        match value_at(self.src, self.at)
+            Some(MsgBool(b)) => Ok(b)
+            _                => Err(DeserializeError { path: self.path, reason: "expected a bool" })
 
     // The integer at `at`, from any of the signed or unsigned formats
     // that fit a signed 64-bit value.
@@ -243,22 +261,31 @@ impl Deserializer for MsgReader
     // the bit pattern, and a caller who needs it reads the document
     // with `mpack` instead.
     fn get_int(self) -> Result<Int, DeserializeError>
-        todo("mpackserde.MsgReader.get_int")
+        match value_at(self.src, self.at)
+            Some(MsgInt(n))  => Ok(n)
+            Some(MsgUint(_)) => Err(DeserializeError { path: self.path,
+                reason: "an unsigned integer above 2^63 does not fit an Int" })
+            _                => Err(DeserializeError { path: self.path, reason: "expected an integer" })
 
     // The float at `at`, from either width.
     fn get_float(self) -> Result<Float, DeserializeError>
-        todo("mpackserde.MsgReader.get_float")
+        match value_at(self.src, self.at)
+            Some(MsgFloat64(f)) => Ok(f)
+            Some(MsgFloat32(f)) => Ok(f)
+            _                   => Err(DeserializeError { path: self.path, reason: "expected a float" })
 
     // The string at `at`.
     //
-    // A `bin` is NOT accepted, even when its bytes are valid UTF-8:
+    // A `bin` is not accepted, even when its bytes are valid UTF-8:
     // the document said it was bytes, and the whole point of the family
     // split is that a reader does not have to guess.
     fn get_str(self) -> Result<Str, DeserializeError>
-        todo("mpackserde.MsgReader.get_str")
+        match value_at(self.src, self.at)
+            Some(MsgStr(t)) => Ok(t)
+            _               => Err(DeserializeError { path: self.path, reason: "expected a str" })
 
     fn fail(self, reason: Str) -> DeserializeError
-        todo("mpackserde.MsgReader.fail")
+        DeserializeError { path: self.path, reason: reason }
 
 // Write any serializable value as MessagePack bytes.
 //
@@ -281,7 +308,10 @@ impl Deserializer for MsgReader
 //         Err(e) => println(e.message())
 // ```
 pub fn to_bytes<T: Serialize>(v: T) -> Result<Bytes, MsgError>
-    todo("mpackserde.to_bytes")
+    let b = writer_bytes(v.serialize(writer()))
+    match mpack.decode_prefix(b)
+        Err(e) => Err(e)
+        Ok(_)  => Ok(b)
 
 // Read MessagePack bytes back into any deserializable type.
 //
@@ -291,7 +321,7 @@ pub fn to_bytes<T: Serialize>(v: T) -> Result<Bytes, MsgError>
 // rather than this package's, because that is what the trait returns
 // and a walk forty members deep is exactly the case its `path` is for.
 //
-// Bytes left over are NOT an error here: a caller decoding one message
+// Bytes left over are not an error here: a caller decoding one message
 // from one buffer checks `reader_at` against the buffer's length, and a
 // caller reading a stream wants `mpackdec`.
 //
@@ -311,4 +341,93 @@ pub fn to_bytes<T: Serialize>(v: T) -> Result<Bytes, MsgError>
 //         Err(e) => println(e.message())
 // ```
 pub fn from_bytes<T: Deserialize>(src: Bytes) -> Result<T, DeserializeError>
-    todo("mpackserde.from_bytes")
+    T.deserialize(reader(src))
+
+// The writer with `more` appended to its document.
+fn wrote(w: MsgWriter, more: [Int]) -> MsgWriter
+    MsgWriter { out: list.concat(w.out, more), depth: w.depth }
+
+// The writer one level deeper or shallower.
+fn deeper(w: MsgWriter, by: Int) -> MsgWriter
+    MsgWriter { out: w.out, depth: w.depth + by }
+
+// A value's encoding as a list of byte values.
+fn encoded(v: mpack.MsgValue) -> [Int]
+    bytes.to_byte_list(mpack.encode(v))
+
+// An array or map header for `n` entries: the fix form below 16, then
+// 16 and 32 bits.
+fn header(n: Int, fix: Int, wide: Int) -> [Int]
+    if n < 16
+        return [fix | n]
+    if n <= 0xFFFF
+        return [wide, n >>> 8, n & 0xFF]
+    [wide + 1, (n >>> 24) & 0xFF, (n >>> 16) & 0xFF, (n >>> 8) & 0xFF, n & 0xFF]
+
+// One byte of the document, or -1 past its end.
+fn byte(src: Bytes, at: Int) -> Int
+    bytes.byte_at(src, at) ?? -1
+
+// The value at `at`, decoded, or `None` when it does not decode.
+fn value_at(src: Bytes, at: Int) -> ?mpack.MsgValue
+    if at < 0 or at >= bytes.len(src)
+        return None
+    match mpack.decode_prefix(bytes.slice(src, at, bytes.len(src)))
+        Ok(p)  => Some(p.value)
+        Err(_) => None
+
+// The offset after the value at `at`, or the end of the document when
+// it does not decode.
+fn skip(src: Bytes, at: Int) -> Int
+    let n = bytes.len(src)
+    if at < 0 or at >= n
+        return n
+    match mpack.decode_prefix(bytes.slice(src, at, n))
+        Ok(p)  => at + p.consumed
+        Err(_) => n
+
+// A big-endian count of `width` bytes after the format byte at `at`.
+fn count_at(src: Bytes, at: Int, width: Int) -> Int
+    list.fold(list.range(at + 1, at + 1 + width), (n, i) => n * 256 + (bytes.byte_at(src, i) ?? 0), 0)
+
+// How many entries the map at `at` has, 0 when it is not a map.
+fn map_count(src: Bytes, at: Int) -> Int
+    let tag = byte(src, at)
+    if tag >= 0x80 and tag <= 0x8F
+        return tag & 0x0F
+    if tag == 0xDE
+        return count_at(src, at, 2)
+    if tag == 0xDF
+        return count_at(src, at, 4)
+    0
+
+// Where the entries of the map at `at` begin.
+fn map_body(src: Bytes, at: Int) -> Int
+    let tag = byte(src, at)
+    at + (if tag == 0xDE then 3 else (if tag == 0xDF then 5 else 1))
+
+// How many elements the array at `at` has.
+fn seq_count(src: Bytes, at: Int) -> Int
+    let tag = byte(src, at)
+    if tag == 0xDC
+        return count_at(src, at, 2)
+    if tag == 0xDD
+        return count_at(src, at, 4)
+    tag & 0x0F
+
+// Where the elements of the array at `at` begin.
+fn seq_body(src: Bytes, at: Int) -> Int
+    let tag = byte(src, at)
+    at + (if tag == 0xDC then 3 else (if tag == 0xDD then 5 else 1))
+
+// The offset of the value whose key is the string `name` in the map at
+// `at`, the first such when there are several.
+fn member_at(src: Bytes, at: Int, name: Str) -> ?Int
+    var key = map_body(src, at)
+    for _ in 0..map_count(src, at)
+        let value = skip(src, key)
+        if let Some(MsgStr(k)) = value_at(src, key)
+            if k == name
+                return Some(value)
+        key = skip(src, value)
+    None

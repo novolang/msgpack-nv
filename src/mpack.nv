@@ -1,37 +1,31 @@
-// mpack — the MessagePack value tree and the encoder that writes it.
+// mpack — the MessagePack value tree, the encoder that writes it and
+// the decoder that reads it.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// MessagePack is JSON's data model with the tags on the wire: every
+// value begins with a format byte that says what it is and how long it
+// is, so a reader that has never seen the schema can walk a document.
+// The specification is the MessagePack format specification at
+// github.com/msgpack/msgpack, revision 2 of 9 August 2017.
 //
-// WHY THE MODULE IS NOT CALLED `msgpack`.  serde-nv already ships a
-// module of that name — the subset its trait walk needs — and two
-// dependencies of one program may not both ship a module with the same
-// name.  `mpack` is what the C implementation of this format is called,
-// so the spelling is a borrowing rather than an invention.  The README
-// says what this package adds over that module and why both exist.
+// The module is not called `msgpack` because serde-nv ships a module
+// of that name, and two dependencies of one program may not both ship
+// one.  `mpack` is what the C implementation of this format is called.
 //
-// WHAT IT IS.  MessagePack is JSON's data model with the tags on the
-// wire: every value begins with a format byte that says what it is and
-// how long it is, so a reader that has never seen the schema can walk a
-// document and a writer never has to announce anything twice.  That is
-// the whole difference from postcard-nv, and it is the reason the trait
-// bridge in `mpackserde` works where postcard's read half does not.
+// There are three ways in.  This module is the value tree: build a
+// `MsgValue`, encode it, decode bytes back to one.  `mpackdec` is the
+// same decoder fed a chunk at a time.  `mpackserde` writes and reads a
+// novo-lang type through the standard library's `Serialize` and
+// `Deserialize`.
 //
-// THREE SURFACES, and a reader should know which one they are on.
+// The encoder computes the exact length first and writes into a buffer
+// of that size, so a document is written once.  The decoder reads one
+// value at an offset and answers the value and the offset after it; a
+// container reads its elements the same way, one level deeper, and a
+// level past the limit is refused before it is read.
 //
-//   * The VALUE TREE — this module — is the format itself: build a
-//     `MsgValue`, encode it, decode bytes back to one.  Reach for it
-//     when the other end is not novo-lang, when the document's shape is
-//     not a struct, or when a map's keys are not strings.
-//   * The STREAM — `mpackdec` — is the same decoder fed a chunk at a
-//     time, for a document that arrives off a socket in pieces.
-//   * The TRAIT bridge — `mpackserde` — writes a novo-lang type with no
-//     code to write, over the standard library's `Serialize` and
-//     `Deserialize`.  Reach for it when both ends are novo-lang.
-//
-// THE SPECIFICATION is the MessagePack format specification at
-// github.com/msgpack/msgpack, revision 2 (2017-08-09), and every vector
-// in the tests is from it.
+// The standard library has no binary32 conversion, so `float 32` is
+// read and written from the binary64 bit pattern in integer
+// arithmetic, rounding to nearest with ties to even as IEEE 754 does.
 
 // A MessagePack value.
 //
@@ -53,7 +47,9 @@ pub enum MsgValue
     // through `int 64`, and the `uint` formats small enough to fit a
     // signed 64-bit integer.
     //
-    // An encoder writes the SHORTEST format that holds `v`, which is
+    // An encoder writes the shortest format that holds `v`: a fixint,
+    // then `uint 8` to `uint 64` for a positive value and `int 8` to
+    // `int 64` for a negative one, as msgpack-python does.  That is
     // what the specification recommends and what every other
     // implementation does; a decoder accepts every format and answers
     // this.  So the round trip preserves the number and not the
@@ -90,7 +86,7 @@ pub enum MsgValue
     MsgArray(items: [MsgValue])
     // The `map` family: fixmap, `map 16`, `map 32`.
     //
-    // A LIST of pairs rather than a keyed collection, for two reasons
+    // A list of pairs rather than a keyed collection, for two reasons
     // the format forces: a MessagePack key is any value and not only a
     // string, and the specification permits duplicate keys and does not
     // say which wins.  A reader that wants "the value for `name`" calls
@@ -136,7 +132,8 @@ pub struct MsgTimestamp
 // Every variant but the last two is an input fault, so it is a value:
 // bytes arriving off a wire are data, and refusing to answer is a
 // result while crashing is not.  Each carries the offset it was found
-// at.
+// at, or -1 when it came from an accessor or from `timestamp_of`, which
+// read a value rather than bytes.
 //
 // The names are all prefixed because a variant is constructed by name
 // across the whole assembly, and `Truncated` is the name every codec
@@ -151,7 +148,9 @@ pub enum MsgError
     // A `str` whose bytes are not UTF-8.  `bin` has no such rule, which
     // is what `bin` is for.
     MsgBadUtf8(at: Int)
-    // The value nested deeper than the decoder's limit.
+    // The value nested deeper than the decoder's limit.  `depth` is the
+    // limit it passed, and `at` the offset of the value one level too
+    // deep.
     //
     // Not pedantry: an array header costs one byte and can open a
     // hundred thousand levels, so a decoder without a limit is a stack
@@ -179,7 +178,15 @@ impl Error for MsgError
     // Answer the one-line report: what was wrong, and at what byte
     // offset.
     fn message(self) -> Str
-        todo("mpack.MsgError.message")
+        match self
+            MsgTruncated(at, need)           => "msgpack: the value at offset ${at} needs ${need} more bytes"
+            MsgReservedFormat(at, tag)       => "msgpack: format byte ${tag} at offset ${at} is reserved"
+            MsgBadUtf8(at)                   => "msgpack: the str at offset ${at} is not UTF-8"
+            MsgDepthExceeded(at, depth)      => "msgpack: the value at offset ${at} nests past the limit of ${depth}"
+            MsgTrailingBytes(at, len)        => "msgpack: ${len} bytes follow the value, from offset ${at}"
+            MsgUnexpectedType(at, want, saw) => unexpected(at, want, saw)
+            MsgBadTimestamp(at, len)         => "msgpack: a timestamp of ${len} bytes at offset ${at} is not one of the three forms"
+            MsgBufferTooSmall(need, have)    => "msgpack: the value needs ${need} bytes and the buffer has ${have}"
 
 // ── Reading a value that has already been decoded ───────────────────
 
@@ -197,26 +204,44 @@ impl Error for MsgError
 //     println(mpack.type_name(MsgNil))   // nil
 // ```
 pub fn type_name(v: MsgValue) -> Str
-    todo("mpack.type_name")
+    match v
+        MsgNil        => "nil"
+        MsgBool(_)    => "bool"
+        MsgInt(_)     => "int"
+        MsgUint(_)    => "uint"
+        MsgFloat32(_) => "float32"
+        MsgFloat64(_) => "float64"
+        MsgStr(_)     => "str"
+        MsgBin(_)     => "bin"
+        MsgArray(_)   => "array"
+        MsgMap(_)     => "map"
+        MsgExt(_, _)  => "ext"
 
 // The integer in `v`, or `MsgUnexpectedType`.
 //
-// `MsgUint` is NOT accepted here even though it holds an integer: its
+// `MsgUint` is not accepted here even though it holds an integer: its
 // value does not fit a signed `Int`, and answering the bit pattern
 // would hand a caller a negative number for a positive document.
 pub fn as_int(v: MsgValue) -> Result<Int, MsgError>
-    todo("mpack.as_int")
+    match v
+        MsgInt(n) => Ok(n)
+        _         => Err(MsgUnexpectedType(-1, "int", type_name(v)))
 
 // The boolean in `v`, or `MsgUnexpectedType`.
 pub fn as_bool(v: MsgValue) -> Result<Bool, MsgError>
-    todo("mpack.as_bool")
+    match v
+        MsgBool(b) => Ok(b)
+        _          => Err(MsgUnexpectedType(-1, "bool", type_name(v)))
 
 // The float in `v`, or `MsgUnexpectedType`.
 //
 // Both widths answer here: a caller that cares which one it was matches
 // on the value instead.
 pub fn as_float(v: MsgValue) -> Result<Float, MsgError>
-    todo("mpack.as_float")
+    match v
+        MsgFloat32(f) => Ok(f)
+        MsgFloat64(f) => Ok(f)
+        _             => Err(MsgUnexpectedType(-1, "float", type_name(v)))
 
 // The string in `v`, or `MsgUnexpectedType`.
 //
@@ -224,26 +249,34 @@ pub fn as_float(v: MsgValue) -> Result<Float, MsgError>
 // because the document said otherwise and that distinction is what the
 // `bin` family was added for.
 pub fn as_str(v: MsgValue) -> Result<Str, MsgError>
-    todo("mpack.as_str")
+    match v
+        MsgStr(t) => Ok(t)
+        _         => Err(MsgUnexpectedType(-1, "str", type_name(v)))
 
 // The bytes in `v`, or `MsgUnexpectedType`.
 pub fn as_bytes(v: MsgValue) -> Result<Bytes, MsgError>
-    todo("mpack.as_bytes")
+    match v
+        MsgBin(b) => Ok(bytes.clone(b))
+        _         => Err(MsgUnexpectedType(-1, "bin", type_name(v)))
 
 // The elements of `v`, or `MsgUnexpectedType`.
 pub fn as_array(v: MsgValue) -> Result<[MsgValue], MsgError>
-    todo("mpack.as_array")
+    match v
+        MsgArray(items) => Ok(items[:])
+        _               => Err(MsgUnexpectedType(-1, "array", type_name(v)))
 
 // The entries of `v`, in the order the document wrote them, or
 // `MsgUnexpectedType`.
 pub fn as_map(v: MsgValue) -> Result<[MsgPair], MsgError>
-    todo("mpack.as_map")
+    match v
+        MsgMap(entries) => Ok(entries[:])
+        _               => Err(MsgUnexpectedType(-1, "map", type_name(v)))
 
 // The value `key` maps to in `v`, or `MsgUnexpectedType` when `v` is
 // not a map and `MsgUnexpectedType` with `want` naming the key when it
 // has no such entry.
 //
-// The FIRST match wins, because the specification permits duplicate
+// The first match wins, because the specification permits duplicate
 // keys and does not say which one does — so this answers the one a
 // reader scanning the document would reach first, and a caller that
 // cares about duplicates walks `as_map` instead.
@@ -262,7 +295,13 @@ pub fn as_map(v: MsgValue) -> Result<[MsgPair], MsgError>
 //                 Err(e2) => println(e2.message())
 // ```
 pub fn get(v: MsgValue, key: Str) -> Result<MsgValue, MsgError>
-    todo("mpack.get")
+    match v
+        MsgMap(entries) =>
+            for e in entries
+                if key_is(e.key, key)
+                    return Ok(e.value)
+            Err(MsgUnexpectedType(-1, key, "none"))
+        _               => Err(MsgUnexpectedType(-1, "map", type_name(v)))
 
 // ── The timestamp extension ─────────────────────────────────────────
 
@@ -271,7 +310,7 @@ pub fn get(v: MsgValue, key: Str) -> Result<MsgValue, MsgError>
 // The only negative `ext` type assigned, and the reason `MsgExt.kind`
 // is signed.
 pub fn timestamp_type() -> Int
-    todo("mpack.timestamp_type")
+    -1
 
 // `t` as the `ext` value that carries it, in the shortest of the three
 // widths that holds it.
@@ -282,7 +321,15 @@ pub fn timestamp_type() -> Int
 // than a malformed extension — the refusal a caller can act on is
 // `timestamp_of`'s, on the way back.
 pub fn timestamp_value(t: MsgTimestamp) -> MsgValue
-    todo("mpack.timestamp_value")
+    let s = t.seconds
+    let ns = t.nanos
+    if ns < 0 or ns > 999999999
+        return MsgNil
+    if ns == 0 and s >= 0 and s <= 0xFFFFFFFF
+        return MsgExt(-1, be_bytes(s, 4))
+    if s >= 0 and s < 0x400000000
+        return MsgExt(-1, be_bytes(ns * 0x400000000 + s, 8))
+    MsgExt(-1, bytes.concat([be_bytes(ns, 4), be_bytes(s, 8)]))
 
 // The timestamp `v` carries, or `MsgUnexpectedType` when `v` is not an
 // `ext` of type -1, or `MsgBadTimestamp` when its payload is not one of
@@ -298,7 +345,26 @@ pub fn timestamp_value(t: MsgTimestamp) -> MsgValue
 //         Err(e)   => println(e.message())
 // ```
 pub fn timestamp_of(v: MsgValue) -> Result<MsgTimestamp, MsgError>
-    todo("mpack.timestamp_of")
+    match v
+        MsgExt(kind, data) =>
+            if kind != -1
+                return Err(MsgUnexpectedType(-1, "timestamp", "ext ${kind}"))
+            let n = bytes.len(data)
+            if n == 4
+                return Ok(MsgTimestamp { seconds: be_at(data, 0, 4), nanos: 0 })
+            if n == 8
+                let packed = be_at(data, 0, 8)
+                let ns = packed >>> 34
+                if ns > 999999999
+                    return Err(MsgBadTimestamp(-1, n))
+                return Ok(MsgTimestamp { seconds: packed & 0x3FFFFFFFF, nanos: ns })
+            if n == 12
+                let ns = be_at(data, 0, 4)
+                if ns > 999999999
+                    return Err(MsgBadTimestamp(-1, n))
+                return Ok(MsgTimestamp { seconds: be_at(data, 4, 8), nanos: ns })
+            Err(MsgBadTimestamp(-1, n))
+        _                  => Err(MsgUnexpectedType(-1, "timestamp", type_name(v)))
 
 // ── Writing ─────────────────────────────────────────────────────────
 
@@ -308,7 +374,8 @@ pub fn timestamp_of(v: MsgValue) -> Result<MsgTimestamp, MsgError>
 // format table reads, and what a caller peeking at a document's first
 // byte compares against.
 pub fn format_byte(v: MsgValue) -> Int
-    todo("mpack.format_byte")
+    let head = encode(header_only(v))
+    bytes.byte_at(head, 0) ?? 0
 
 // How many bytes `v` encodes to, without encoding it.
 //
@@ -324,7 +391,21 @@ pub fn format_byte(v: MsgValue) -> Int
 //     println("${mpack.encoded_len(MsgInt(1))}")   // 1 — a positive fixint
 // ```
 pub fn encoded_len(v: MsgValue) -> Int
-    todo("mpack.encoded_len")
+    match v
+        MsgNil          => 1
+        MsgBool(_)      => 1
+        MsgInt(n)       => int_len(n)
+        MsgUint(b)      => if b < 0
+            9
+        else
+            int_len(b)
+        MsgFloat32(_)   => 5
+        MsgFloat64(_)   => 9
+        MsgStr(t)       => str_head_len(bytes.len(bytes.from_str(t))) + bytes.len(bytes.from_str(t))
+        MsgBin(b)       => bin_head_len(bytes.len(b)) + bytes.len(b)
+        MsgArray(items) => count_head_len(list.len(items)) + list.fold(items, (n, x) => n + encoded_len(x), 0)
+        MsgMap(entries) => count_head_len(list.len(entries)) + list.fold(entries, (n, e) => n + encoded_len(e.key) + encoded_len(e.value), 0)
+        MsgExt(_, data) => ext_head_len(bytes.len(data)) + bytes.len(data)
 
 // Encode `v` and answer the bytes.
 //
@@ -343,15 +424,22 @@ pub fn encoded_len(v: MsgValue) -> Int
 //     // 920102 — fixarray of two, then two positive fixints
 // ```
 pub fn encode(v: MsgValue) -> Bytes
-    todo("mpack.encode")
+    var out = bytes.zeros(encoded_len(v))
+    write(out, 0, v)
+    out
 
 // Encode `v` into a buffer the caller already owns, and answer the
 // bytes written.
 //
 // `MsgBufferTooSmall` when the cursor has less room than `encoded_len`
 // says, and nothing is written in that case.
-pub fn encode_into(v: MsgValue, mut dst: Cursor) -> Result<Int, MsgError>
-    todo("mpack.encode_into")
+pub fn encode_into(v: MsgValue, var dst: Cursor) -> Result<Int, MsgError>
+    let need = encoded_len(v)
+    let have = dst.remaining()
+    if have < need
+        return Err(MsgBufferTooSmall(need, have))
+    dst.put_bytes(encode(v))
+    Ok(need)
 
 // ── Reading bytes ───────────────────────────────────────────────────
 
@@ -371,7 +459,13 @@ pub fn encode_into(v: MsgValue, mut dst: Cursor) -> Result<Int, MsgError>
 //         Err(e) => println(e.message())
 // ```
 pub fn decode(src: Bytes) -> Result<MsgValue, MsgError>
-    todo("mpack.decode")
+    match read(src, 0, 1, default_depth_limit())
+        Err(e) => Err(e)
+        Ok(p)  =>
+            let n = bytes.len(src)
+            if p.consumed < n
+                return Err(MsgTrailingBytes(p.consumed, n - p.consumed))
+            Ok(p.value)
 
 // One value and the bytes it occupied: what `decode_prefix` answers.
 //
@@ -388,7 +482,26 @@ pub struct MsgPrefix
 // buffer wants.  A buffer that ends inside the value is `MsgTruncated`,
 // which is also how a caller learns to read more.
 pub fn decode_prefix(src: Bytes) -> Result<MsgPrefix, MsgError>
-    todo("mpack.decode_prefix")
+    read(src, 0, 1, default_depth_limit())
+
+// Decode the first document in `src` with a nesting limit of the
+// caller's choosing, and say how long it was.
+//
+// `decode_prefix` with `default_depth_limit()` in place of `limit`.  A
+// limit below 1 is taken as 1.  `mpackdec` reads each value through
+// this, with the limit its decoder carries.
+//
+// ```novo
+// use std.bytes
+// use mpack
+//
+// fn main() [io]
+//     match mpack.decode_prefix_limited(bytes.from_hex("9191c0") ?? bytes.zeros(0), 2)
+//         Ok(p)  => println("${p.consumed}")
+//         Err(e) => println(e.message())   // nests past the limit of 2
+// ```
+pub fn decode_prefix_limited(src: Bytes, limit: Int) -> Result<MsgPrefix, MsgError>
+    read(src, 0, 1, (if limit < 1 then 1 else limit))
 
 // The deepest nesting `decode` and `decode_prefix` accept: 64.
 //
@@ -398,4 +511,428 @@ pub fn decode_prefix(src: Bytes) -> Result<MsgPrefix, MsgError>
 // `MsgDepthExceeded`, and `mpackdec.with_depth_limit` is how a caller
 // who genuinely has deeper data raises it.
 pub fn default_depth_limit() -> Int
-    todo("mpack.default_depth_limit")
+    64
+
+// The message for a value of the wrong family, with its offset when it
+// has one.
+fn unexpected(at: Int, want: Str, saw: Str) -> Str
+    if at < 0
+        return "msgpack: wanted ${want} and found ${saw}"
+    "msgpack: wanted ${want} and found ${saw} at offset ${at}"
+
+// ── How the bytes are written ───────────────────────────────────────
+
+// The value with its payload taken out, which begins with the same
+// format byte as the value itself.
+fn header_only(v: MsgValue) -> MsgValue
+    match v
+        MsgArray(items) => MsgArray(list.map(items, x => MsgNil))
+        MsgMap(entries) => MsgMap(list.map(entries, e => MsgPair { key: MsgNil, value: MsgNil }))
+        _               => v
+
+// `n` as `width` bytes, big-endian.
+fn be_bytes(n: Int, width: Int) -> Bytes
+    var out = bytes.zeros(width)
+    for k in 0..width
+        bytes.set_u8(out, k, (n >>> (8 * (width - 1 - k))) & 0xFF)
+    out
+
+// The unsigned big-endian number of `width` bytes at `at`.  Eight
+// bytes read as a signed `Int`, so a value above 2^63 is its bit
+// pattern.
+fn be_at(b: Bytes, at: Int, width: Int) -> Int
+    list.fold(list.range(at, at + width), (n, i) => (n << 8) | (bytes.byte_at(b, i) ?? 0), 0)
+
+// How many bytes an integer takes.
+fn int_len(n: Int) -> Int
+    if n >= -32 and n <= 127
+        return 1
+    if n >= 0
+        return if n <= 0xFF then 2 else (if n <= 0xFFFF then 3 else (if n <= 0xFFFFFFFF then 5 else 9))
+    if n >= -128
+        return 2
+    if n >= -32768
+        return 3
+    if n >= -2147483648
+        return 5
+    9
+
+fn str_head_len(n: Int) -> Int
+    if n < 32
+        return 1
+    if n <= 0xFF
+        return 2
+    if n <= 0xFFFF
+        return 3
+    5
+
+fn bin_head_len(n: Int) -> Int
+    if n <= 0xFF
+        return 2
+    if n <= 0xFFFF
+        return 3
+    5
+
+fn count_head_len(n: Int) -> Int
+    if n < 16
+        return 1
+    if n <= 0xFFFF
+        return 3
+    5
+
+fn ext_head_len(n: Int) -> Int
+    if n == 1 or n == 2 or n == 4 or n == 8 or n == 16
+        return 2
+    if n <= 0xFF
+        return 3
+    if n <= 0xFFFF
+        return 4
+    6
+
+// Write `n` big-endian in `width` bytes at `at`, and answer the offset
+// after it.
+fn put(var out: Bytes, at: Int, n: Int, width: Int) -> Int
+    for k in 0..width
+        bytes.set_u8(out, at + k, (n >>> (8 * (width - 1 - k))) & 0xFF)
+    at + width
+
+// A format byte followed by a big-endian number.
+fn tagged(var out: Bytes, at: Int, tag: Int, n: Int, width: Int) -> Int
+    bytes.set_u8(out, at, tag)
+    put(out, at + 1, n, width)
+
+// Raw bytes at `at`, and the offset after them.
+fn raw(var out: Bytes, at: Int, data: Bytes) -> Int
+    bytes.copy_into(out, at, data, 0, bytes.len(data))
+    at + bytes.len(data)
+
+// Write `v` at `at` and answer the offset after it.
+fn write(var out: Bytes, at: Int, v: MsgValue) -> Int
+    match v
+        MsgNil          => put(out, at, 0xC0, 1)
+        MsgBool(b)      => put(out, at, (if b then 0xC3 else 0xC2), 1)
+        MsgInt(n)       => write_int(out, at, n)
+        MsgUint(b)      => if b < 0
+            tagged(out, at, 0xCF, b, 8)
+        else
+            write_int(out, at, b)
+        MsgFloat32(f)   => tagged(out, at, 0xCA, f32_bits(f), 4)
+        MsgFloat64(f)   => tagged(out, at, 0xCB, float.to_bits(f), 8)
+        MsgStr(t)       => write_str(out, at, bytes.from_str(t))
+        MsgBin(b)       => raw(out, write_bin_head(out, at, bytes.len(b)), b)
+        MsgArray(items) => list.fold(items, (off, x) => write(out, off, x), write_count(out, at, list.len(items), 0x90, 0xDC))
+        MsgMap(entries) => list.fold(entries,
+            (off, e) => write(out, write(out, off, e.key), e.value),
+            write_count(out, at, list.len(entries), 0x80, 0xDE))
+        MsgExt(kind, d) => raw(out, write_ext_head(out, at, kind, bytes.len(d)), d)
+
+fn write_int(var out: Bytes, at: Int, n: Int) -> Int
+    if n >= 0 and n <= 127
+        return put(out, at, n, 1)
+    if n < 0 and n >= -32
+        return put(out, at, n & 0xFF, 1)
+    if n >= 0
+        if n <= 0xFF
+            return tagged(out, at, 0xCC, n, 1)
+        if n <= 0xFFFF
+            return tagged(out, at, 0xCD, n, 2)
+        if n <= 0xFFFFFFFF
+            return tagged(out, at, 0xCE, n, 4)
+        return tagged(out, at, 0xCF, n, 8)
+    if n >= -128
+        return tagged(out, at, 0xD0, n, 1)
+    if n >= -32768
+        return tagged(out, at, 0xD1, n, 2)
+    if n >= -2147483648
+        return tagged(out, at, 0xD2, n, 4)
+    tagged(out, at, 0xD3, n, 8)
+
+fn write_str(var out: Bytes, at: Int, b: Bytes) -> Int
+    let n = bytes.len(b)
+    let next = if n < 32
+        put(out, at, 0xA0 | n, 1)
+    else
+        if n <= 0xFF
+            tagged(out, at, 0xD9, n, 1)
+        else
+            if n <= 0xFFFF
+                tagged(out, at, 0xDA, n, 2)
+            else
+                tagged(out, at, 0xDB, n, 4)
+    raw(out, next, b)
+
+fn write_bin_head(var out: Bytes, at: Int, n: Int) -> Int
+    if n <= 0xFF
+        return tagged(out, at, 0xC4, n, 1)
+    if n <= 0xFFFF
+        return tagged(out, at, 0xC5, n, 2)
+    tagged(out, at, 0xC6, n, 4)
+
+// An array or map header: the fix form below 16, then 16 and 32 bits.
+fn write_count(var out: Bytes, at: Int, n: Int, fix: Int, wide: Int) -> Int
+    if n < 16
+        return put(out, at, fix | n, 1)
+    if n <= 0xFFFF
+        return tagged(out, at, wide, n, 2)
+    tagged(out, at, wide + 1, n, 4)
+
+fn write_ext_head(var out: Bytes, at: Int, kind: Int, n: Int) -> Int
+    let fixed = if n == 1
+        0xD4
+    else
+        if n == 2
+            0xD5
+        else
+            if n == 4
+                0xD6
+            else
+                if n == 8
+                    0xD7
+                else
+                    if n == 16
+                        0xD8
+                    else
+                        0
+    let next = if fixed != 0
+        put(out, at, fixed, 1)
+    else
+        if n <= 0xFF
+            tagged(out, at, 0xC7, n, 1)
+        else
+            if n <= 0xFFFF
+                tagged(out, at, 0xC8, n, 2)
+            else
+                tagged(out, at, 0xC9, n, 4)
+    put(out, next, kind & 0xFF, 1)
+
+// The binary32 bit pattern nearest a binary64 value, ties to even.
+fn f32_bits(f: Float) -> Int
+    let b = float.to_bits(f)
+    let sign = (b >>> 63) << 31
+    let exp = (b >>> 52) & 0x7FF
+    let frac = b & 0xFFFFFFFFFFFFF
+    if exp == 0x7FF
+        return sign | 0x7F800000 | (if frac != 0 then 0x400000 | (frac >>> 29) else 0)
+    let e = exp - 1023 + 127
+    if e >= 0xFF
+        return sign | 0x7F800000
+    if e >= 1
+        return sign | rounded((e << 52) | frac, 29)
+    let shift = 29 + 1 - e
+    if shift > 54
+        return sign
+    sign | rounded(frac | (1 << 52), shift)
+
+// `x` shifted right by `shift` bits, rounded to nearest with ties to
+// even.  A carry out of the mantissa moves into the exponent, which is
+// the right answer for both a normal and a subnormal value.
+fn rounded(x: Int, shift: Int) -> Int
+    let kept = x >>> shift
+    let rest = x & ((1 << shift) - 1)
+    let half = 1 << (shift - 1)
+    if rest > half or rest == half and (kept & 1) == 1
+        return kept + 1
+    kept
+
+// The binary64 value of a binary32 bit pattern, which is exact.
+fn f32_value(bits: Int) -> Float
+    let sign = (bits >>> 31) & 1
+    let exp = (bits >>> 23) & 0xFF
+    let frac = bits & 0x7FFFFF
+    if exp == 0xFF
+        return float.from_bits((sign << 63) | (0x7FF << 52) | (frac << 29))
+    if exp == 0
+        let magnitude = frac as Float * float.from_bits((1023 - 149) << 52)
+        return float.from_bits(float.to_bits(magnitude) | (sign << 63))
+    float.from_bits((sign << 63) | ((exp - 127 + 1023) << 52) | (frac << 29))
+
+// ── How the bytes are read ──────────────────────────────────────────
+
+// Whether a map key is the string `key`.
+fn key_is(k: MsgValue, key: Str) -> Bool
+    match k
+        MsgStr(t) => t == key
+        _         => false
+
+// The value at `at`, `depth` levels deep, and the offset after it.
+fn read(src: Bytes, at: Int, depth: Int, limit: Int) -> Result<MsgPrefix, MsgError>
+    let n = bytes.len(src)
+    if at >= n
+        return Err(MsgTruncated(at, at + 1 - n))
+    let tag = bytes.byte_at(src, at) ?? 0
+    if tag <= 0x7F
+        return done(MsgInt(tag), at + 1)
+    if tag >= 0xE0
+        return done(MsgInt(tag - 256), at + 1)
+    if tag >= 0xA0 and tag <= 0xBF
+        return read_str(src, at, at + 1, tag & 0x1F)
+    if tag >= 0x90 and tag <= 0x9F
+        return read_array(src, at, at + 1, tag & 0x0F, depth, limit)
+    if tag >= 0x80 and tag <= 0x8F
+        return read_map(src, at, at + 1, tag & 0x0F, depth, limit)
+    match tag
+        0xc0 => done(MsgNil, at + 1)
+        0xc2 => done(MsgBool(false), at + 1)
+        0xc3 => done(MsgBool(true), at + 1)
+        0xc4 => sized(src, at, 1, (len, body) => read_bin(src, at, body, len))
+        0xc5 => sized(src, at, 2, (len, body) => read_bin(src, at, body, len))
+        0xc6 => sized(src, at, 4, (len, body) => read_bin(src, at, body, len))
+        0xc7 => sized(src, at, 1, (len, body) => read_ext(src, at, body, len))
+        0xc8 => sized(src, at, 2, (len, body) => read_ext(src, at, body, len))
+        0xc9 => sized(src, at, 4, (len, body) => read_ext(src, at, body, len))
+        0xca => fixed(src, at, 4, bits => MsgFloat32(f32_value(bits)))
+        0xcb => fixed(src, at, 8, bits => MsgFloat64(float.from_bits(bits)))
+        0xcc => fixed(src, at, 1, u => MsgInt(u))
+        0xcd => fixed(src, at, 2, u => MsgInt(u))
+        0xce => fixed(src, at, 4, u => MsgInt(u))
+        0xcf => fixed(src, at, 8, u => (if u < 0 then MsgUint(u) else MsgInt(u)))
+        0xd0 => fixed(src, at, 1, u => MsgInt(signed(u, 1)))
+        0xd1 => fixed(src, at, 2, u => MsgInt(signed(u, 2)))
+        0xd2 => fixed(src, at, 4, u => MsgInt(signed(u, 4)))
+        0xd3 => fixed(src, at, 8, u => MsgInt(u))
+        0xd4 => read_ext(src, at, at + 1, 1)
+        0xd5 => read_ext(src, at, at + 1, 2)
+        0xd6 => read_ext(src, at, at + 1, 4)
+        0xd7 => read_ext(src, at, at + 1, 8)
+        0xd8 => read_ext(src, at, at + 1, 16)
+        0xd9 => sized(src, at, 1, (len, body) => read_str(src, at, body, len))
+        0xda => sized(src, at, 2, (len, body) => read_str(src, at, body, len))
+        0xdb => sized(src, at, 4, (len, body) => read_str(src, at, body, len))
+        0xdc => sized(src, at, 2, (len, body) => read_array(src, at, body, len, depth, limit))
+        0xdd => sized(src, at, 4, (len, body) => read_array(src, at, body, len, depth, limit))
+        0xde => sized(src, at, 2, (len, body) => read_map(src, at, body, len, depth, limit))
+        0xdf => sized(src, at, 4, (len, body) => read_map(src, at, body, len, depth, limit))
+        _    => Err(MsgReservedFormat(at, tag))
+
+fn done(v: MsgValue, next: Int) -> Result<MsgPrefix, MsgError>
+    Ok(MsgPrefix { value: v, consumed: next })
+
+// A number read as `width` bytes after the format byte at `at`.
+fn fixed(src: Bytes, at: Int, width: Int, make: fn(Int) -> MsgValue) -> Result<MsgPrefix, MsgError>
+    let n = bytes.len(src)
+    if at + 1 + width > n
+        return Err(MsgTruncated(at, at + 1 + width - n))
+    done(make(be_at(src, at + 1, width)), at + 1 + width)
+
+// A length of `width` bytes after the format byte at `at`, handed on
+// with the offset its body starts at.
+fn sized(src: Bytes, at: Int, width: Int,
+         rest: fn(Int, Int) -> Result<MsgPrefix, MsgError>) -> Result<MsgPrefix, MsgError>
+    let n = bytes.len(src)
+    if at + 1 + width > n
+        return Err(MsgTruncated(at, at + 1 + width - n))
+    rest(be_at(src, at + 1, width), at + 1 + width)
+
+// An unsigned number of `width` bytes read as two's complement.
+fn signed(u: Int, width: Int) -> Int
+    let top = 1 << (8 * width - 1)
+    if u >= top
+        return u - 2 * top
+    u
+
+fn read_str(src: Bytes, at: Int, body: Int, len: Int) -> Result<MsgPrefix, MsgError>
+    let n = bytes.len(src)
+    if body + len > n
+        return Err(MsgTruncated(at, body + len - n))
+    let b = bytes.slice(src, body, body + len)
+    let bad = utf8_fault(b)
+    if bad >= 0
+        return Err(MsgBadUtf8(body + bad))
+    done(MsgStr(bytes.to_str(b)), body + len)
+
+fn read_bin(src: Bytes, at: Int, body: Int, len: Int) -> Result<MsgPrefix, MsgError>
+    let n = bytes.len(src)
+    if body + len > n
+        return Err(MsgTruncated(at, body + len - n))
+    done(MsgBin(bytes.slice(src, body, body + len)), body + len)
+
+// An `ext`: the type byte at `body`, then `len` bytes of payload.
+fn read_ext(src: Bytes, at: Int, body: Int, len: Int) -> Result<MsgPrefix, MsgError>
+    let n = bytes.len(src)
+    if body + 1 + len > n
+        return Err(MsgTruncated(at, body + 1 + len - n))
+    let kind = signed(bytes.byte_at(src, body) ?? 0, 1)
+    done(MsgExt(kind, bytes.slice(src, body + 1, body + 1 + len)), body + 1 + len)
+
+fn read_array(src: Bytes, at: Int, body: Int, count: Int, depth: Int,
+              limit: Int) -> Result<MsgPrefix, MsgError>
+    var items: [MsgValue] = []
+    var next = body
+    for _ in 0..count
+        if depth + 1 > limit
+            return Err(MsgDepthExceeded(next, limit))
+        match read(src, next, depth + 1, limit)
+            Err(e) =>
+                return Err(e)
+            Ok(p)  =>
+                list.push(items, p.value)
+                next = p.consumed
+    done(MsgArray(items), next)
+
+fn read_map(src: Bytes, at: Int, body: Int, count: Int, depth: Int,
+            limit: Int) -> Result<MsgPrefix, MsgError>
+    var entries: [MsgPair] = []
+    var next = body
+    for _ in 0..count
+        if depth + 1 > limit
+            return Err(MsgDepthExceeded(next, limit))
+        match read(src, next, depth + 1, limit)
+            Err(e) =>
+                return Err(e)
+            Ok(k)  =>
+                match read(src, k.consumed, depth + 1, limit)
+                    Err(e) =>
+                        return Err(e)
+                    Ok(v)  =>
+                        list.push(entries, MsgPair { key: k.value, value: v.value })
+                        next = v.consumed
+    done(MsgMap(entries), next)
+
+// The offset of the first byte that breaks UTF-8 in `b`, or -1: an
+// unexpected continuation byte, a truncated sequence, an overlong
+// form, a surrogate, or a code point past U+10FFFF.
+fn utf8_fault(b: Bytes) -> Int
+    let n = bytes.len(b)
+    var i = 0
+    for _ in 0..n
+        if i >= n
+            break
+        let c = bytes.byte_at(b, i) ?? 0
+        let width = if c < 0x80
+            1
+        else
+            if c >= 0xC2 and c <= 0xDF
+                2
+            else
+                if c >= 0xE0 and c <= 0xEF
+                    3
+                else
+                    if c >= 0xF0 and c <= 0xF4
+                        4
+                    else
+                        0
+        if width == 0 or i + width > n
+            return i
+        if width > 1
+            let second = bytes.byte_at(b, i + 1) ?? 0
+            let low = if c == 0xE0
+                0xA0
+            else
+                if c == 0xF0
+                    0x90
+                else
+                    0x80
+            let high = if c == 0xED
+                0x9F
+            else
+                if c == 0xF4
+                    0x8F
+                else
+                    0xBF
+            if second < low or second > high
+                return i
+            for k in i + 2..i + width
+                if ((bytes.byte_at(b, k) ?? 0) & 0xC0) != 0x80
+                    return i
+        i = i + width
+    -1
