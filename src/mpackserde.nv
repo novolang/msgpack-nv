@@ -216,6 +216,8 @@ impl Deserializer for MsgReader
         var out: [Str] = []
         var at = map_body(self.src, self.at)
         for _ in 0..count
+            if at >= bytes.len(self.src)
+                break
             if let Some(MsgStr(k)) = value_at(self.src, at)
                 list.push(out, k)
             at = skip(self.src, skip(self.src, at))
@@ -241,6 +243,8 @@ impl Deserializer for MsgReader
                     return Err(DeserializeError { path: self.path, reason: "no element ${i} of ${n}" })
                 var at = seq_body(self.src, self.at)
                 for _ in 0..i
+                    if at >= bytes.len(self.src)
+                        break
                     at = skip(self.src, at)
                 Ok(MsgReader { src: self.src, at: at, path: self.path + "[${i}]" })
 
@@ -425,6 +429,8 @@ fn seq_body(src: Bytes, at: Int) -> Int
 fn member_at(src: Bytes, at: Int, name: Str) -> ?Int
     var key = map_body(src, at)
     for _ in 0..map_count(src, at)
+        if key >= bytes.len(src)
+            break
         let value = skip(src, key)
         if let Some(MsgStr(k)) = value_at(src, key)
             if k == name

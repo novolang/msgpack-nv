@@ -1,0 +1,36 @@
+// tests/hostile_tests.nv — containers whose declared counts exceed the bytes present.
+
+use std.test
+use std.bytes
+use mpackserde
+
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+@test
+fn test_a_map_count_of_four_billion_with_no_entries_lists_no_keys() [io]
+    let r = mpackserde.reader(hex("dfffffffff"))
+    test.assert_eq(r.keys().len(), 0)
+
+@test
+fn test_a_member_lookup_in_a_map_with_a_huge_count_ends_at_the_data() [io]
+    let r = mpackserde.reader(hex("dfffffffffa16101"))
+    match r.field("b")
+        Ok(_)  => test.fail("a missing member was found")
+        Err(_) => test.assert_eq(1, 1)
+    match r.field("a")
+        Ok(m)  => test.assert_eq(m.is_null(), false)
+        Err(e) => test.fail(e.reason)
+
+@test
+fn test_an_element_of_an_array_with_a_huge_count_ends_at_the_data() [io]
+    let r = mpackserde.reader(hex("ddffffffff01"))
+    match r.seq_at(4294967294)
+        Ok(m)  => test.assert_eq(m.is_null(), false)
+        Err(_) => test.assert_eq(1, 1)
+    match r.seq_at(0)
+        Ok(m)  =>
+            match m.get_int()
+                Ok(n)  => test.assert_eq(n, 1)
+                Err(e) => test.fail(e.reason)
+        Err(e) => test.fail(e.reason)
