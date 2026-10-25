@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.2 — 2026-10-25
+
+The tests now cover the error paths and the refusal arms that the coverage gate reports, and a region that cannot run carries a `cov: skip` marker with its reason.  No signature and no behaviour changed.
+
 ## 0.1.1 — 2026-10-25
 
 A call that passes a variable to a `var` parameter now writes the `var` marker, which the 0.21.1 compiler asks for (E2050).  The package needs Novo 0.21.1 or later.  No signature and no behaviour changed.

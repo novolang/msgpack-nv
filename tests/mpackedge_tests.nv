@@ -439,3 +439,10 @@ fn str_fault(r: Result<Str, DeserializeError>) -> Str
 
 fn reader_fault(r: Result<MsgReader, DeserializeError>) -> Str
     fault(r)
+
+@test
+fn test_reading_an_int_from_empty_input_is_a_value() [io]
+    let r: Result<Int, DeserializeError> = mpackserde.from_bytes(bytes.zeros(0))
+    match r
+        Ok(v)  => test.fail("empty input decoded to ${v}")
+        Err(_) => test.assert_true(true, "refused")
