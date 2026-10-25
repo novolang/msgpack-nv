@@ -338,7 +338,7 @@ fn test_encoded_len_is_exact_because_every_length_is_known_first()
 @test
 fn test_encode_into_writes_into_the_callers_buffer()
     var dst = bytes.cursor_le(bytes.zeros(8))
-    match mpack.encode_into(MsgArray([MsgInt(1), MsgInt(2)]), dst)
+    match mpack.encode_into(MsgArray([MsgInt(1), MsgInt(2)]), var dst)
         Err(e) => test.fail(e.message())
         Ok(n)  =>
             test.assert_eq(n, 3)
@@ -347,7 +347,7 @@ fn test_encode_into_writes_into_the_callers_buffer()
 @test
 fn test_encode_into_refuses_a_buffer_smaller_than_the_answer()
     var dst = bytes.cursor_le(bytes.zeros(2))
-    match mpack.encode_into(MsgArray([MsgInt(1), MsgInt(2)]), dst)
+    match mpack.encode_into(MsgArray([MsgInt(1), MsgInt(2)]), var dst)
         Ok(_)  => test.fail("three bytes do not fit two")
         Err(e) =>
             match e

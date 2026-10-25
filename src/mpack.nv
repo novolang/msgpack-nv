@@ -425,7 +425,7 @@ pub fn encoded_len(v: MsgValue) -> Int
 // ```
 pub fn encode(v: MsgValue) -> Bytes
     var out = bytes.zeros(encoded_len(v))
-    write(out, 0, v)
+    write(var out, 0, v)
     out
 
 // Encode `v` into a buffer the caller already owns, and answer the
@@ -599,7 +599,7 @@ fn put(var out: Bytes, at: Int, n: Int, width: Int) -> Int
 // A format byte followed by a big-endian number.
 fn tagged(var out: Bytes, at: Int, tag: Int, n: Int, width: Int) -> Int
     bytes.set_u8(out, at, tag)
-    put(out, at + 1, n, width)
+    put(var out, at + 1, n, width)
 
 // Raw bytes at `at`, and the offset after them.
 fn raw(var out: Bytes, at: Int, data: Bytes) -> Int
@@ -609,72 +609,72 @@ fn raw(var out: Bytes, at: Int, data: Bytes) -> Int
 // Write `v` at `at` and answer the offset after it.
 fn write(var out: Bytes, at: Int, v: MsgValue) -> Int
     match v
-        MsgNil          => put(out, at, 0xC0, 1)
-        MsgBool(b)      => put(out, at, (if b then 0xC3 else 0xC2), 1)
-        MsgInt(n)       => write_int(out, at, n)
+        MsgNil          => put(var out, at, 0xC0, 1)
+        MsgBool(b)      => put(var out, at, (if b then 0xC3 else 0xC2), 1)
+        MsgInt(n)       => write_int(var out, at, n)
         MsgUint(b)      => if b < 0
-            tagged(out, at, 0xCF, b, 8)
+            tagged(var out, at, 0xCF, b, 8)
         else
-            write_int(out, at, b)
-        MsgFloat32(f)   => tagged(out, at, 0xCA, f32_bits(f), 4)
-        MsgFloat64(f)   => tagged(out, at, 0xCB, float.to_bits(f), 8)
-        MsgStr(t)       => write_str(out, at, bytes.from_str(t))
-        MsgBin(b)       => raw(out, write_bin_head(out, at, bytes.len(b)), b)
-        MsgArray(items) => list.fold(items, (off, x) => write(out, off, x), write_count(out, at, list.len(items), 0x90, 0xDC))
+            write_int(var out, at, b)
+        MsgFloat32(f)   => tagged(var out, at, 0xCA, f32_bits(f), 4)
+        MsgFloat64(f)   => tagged(var out, at, 0xCB, float.to_bits(f), 8)
+        MsgStr(t)       => write_str(var out, at, bytes.from_str(t))
+        MsgBin(b)       => raw(var out, write_bin_head(var out, at, bytes.len(b)), b)
+        MsgArray(items) => list.fold(items, (off, x) => write(var out, off, x), write_count(var out, at, list.len(items), 0x90, 0xDC))
         MsgMap(entries) => list.fold(entries,
-            (off, e) => write(out, write(out, off, e.key), e.value),
-            write_count(out, at, list.len(entries), 0x80, 0xDE))
-        MsgExt(kind, d) => raw(out, write_ext_head(out, at, kind, bytes.len(d)), d)
+            (off, e) => write(var out, write(var out, off, e.key), e.value),
+            write_count(var out, at, list.len(entries), 0x80, 0xDE))
+        MsgExt(kind, d) => raw(var out, write_ext_head(var out, at, kind, bytes.len(d)), d)
 
 fn write_int(var out: Bytes, at: Int, n: Int) -> Int
     if n >= 0 and n <= 127
-        return put(out, at, n, 1)
+        return put(var out, at, n, 1)
     if n < 0 and n >= -32
-        return put(out, at, n & 0xFF, 1)
+        return put(var out, at, n & 0xFF, 1)
     if n >= 0
         if n <= 0xFF
-            return tagged(out, at, 0xCC, n, 1)
+            return tagged(var out, at, 0xCC, n, 1)
         if n <= 0xFFFF
-            return tagged(out, at, 0xCD, n, 2)
+            return tagged(var out, at, 0xCD, n, 2)
         if n <= 0xFFFFFFFF
-            return tagged(out, at, 0xCE, n, 4)
-        return tagged(out, at, 0xCF, n, 8)
+            return tagged(var out, at, 0xCE, n, 4)
+        return tagged(var out, at, 0xCF, n, 8)
     if n >= -128
-        return tagged(out, at, 0xD0, n, 1)
+        return tagged(var out, at, 0xD0, n, 1)
     if n >= -32768
-        return tagged(out, at, 0xD1, n, 2)
+        return tagged(var out, at, 0xD1, n, 2)
     if n >= -2147483648
-        return tagged(out, at, 0xD2, n, 4)
-    tagged(out, at, 0xD3, n, 8)
+        return tagged(var out, at, 0xD2, n, 4)
+    tagged(var out, at, 0xD3, n, 8)
 
 fn write_str(var out: Bytes, at: Int, b: Bytes) -> Int
     let n = bytes.len(b)
     let next = if n < 32
-        put(out, at, 0xA0 | n, 1)
+        put(var out, at, 0xA0 | n, 1)
     else
         if n <= 0xFF
-            tagged(out, at, 0xD9, n, 1)
+            tagged(var out, at, 0xD9, n, 1)
         else
             if n <= 0xFFFF
-                tagged(out, at, 0xDA, n, 2)
+                tagged(var out, at, 0xDA, n, 2)
             else
-                tagged(out, at, 0xDB, n, 4)
-    raw(out, next, b)
+                tagged(var out, at, 0xDB, n, 4)
+    raw(var out, next, b)
 
 fn write_bin_head(var out: Bytes, at: Int, n: Int) -> Int
     if n <= 0xFF
-        return tagged(out, at, 0xC4, n, 1)
+        return tagged(var out, at, 0xC4, n, 1)
     if n <= 0xFFFF
-        return tagged(out, at, 0xC5, n, 2)
-    tagged(out, at, 0xC6, n, 4)
+        return tagged(var out, at, 0xC5, n, 2)
+    tagged(var out, at, 0xC6, n, 4)
 
 // An array or map header: the fix form below 16, then 16 and 32 bits.
 fn write_count(var out: Bytes, at: Int, n: Int, fix: Int, wide: Int) -> Int
     if n < 16
-        return put(out, at, fix | n, 1)
+        return put(var out, at, fix | n, 1)
     if n <= 0xFFFF
-        return tagged(out, at, wide, n, 2)
-    tagged(out, at, wide + 1, n, 4)
+        return tagged(var out, at, wide, n, 2)
+    tagged(var out, at, wide + 1, n, 4)
 
 fn write_ext_head(var out: Bytes, at: Int, kind: Int, n: Int) -> Int
     let fixed = if n == 1
@@ -694,16 +694,16 @@ fn write_ext_head(var out: Bytes, at: Int, kind: Int, n: Int) -> Int
                     else
                         0
     let next = if fixed != 0
-        put(out, at, fixed, 1)
+        put(var out, at, fixed, 1)
     else
         if n <= 0xFF
-            tagged(out, at, 0xC7, n, 1)
+            tagged(var out, at, 0xC7, n, 1)
         else
             if n <= 0xFFFF
-                tagged(out, at, 0xC8, n, 2)
+                tagged(var out, at, 0xC8, n, 2)
             else
-                tagged(out, at, 0xC9, n, 4)
-    put(out, next, kind & 0xFF, 1)
+                tagged(var out, at, 0xC9, n, 4)
+    put(var out, next, kind & 0xFF, 1)
 
 // The binary32 bit pattern nearest a binary64 value, ties to even.
 fn f32_bits(f: Float) -> Int
