@@ -620,7 +620,9 @@ fn write(var out: Bytes, at: Int, v: MsgValue) -> Int
         MsgFloat64(f)   => tagged(var out, at, 0xCB, float.to_bits(f), 8)
         MsgStr(t)       => write_str(var out, at, bytes.from_str(t))
         MsgBin(b)       => raw(var out, write_bin_head(var out, at, bytes.len(b)), b)
-        MsgArray(items) => list.fold(items, (off, x) => write(var out, off, x), write_count(var out, at, list.len(items), 0x90, 0xDC))
+        MsgArray(items) => list.fold(items,
+            (off, x) => write(var out, off, x),
+            write_count(var out, at, list.len(items), 0x90, 0xDC))
         MsgMap(entries) => list.fold(entries,
             (off, e) => write(var out, write(var out, off, e.key), e.value),
             write_count(var out, at, list.len(entries), 0x80, 0xDE))
