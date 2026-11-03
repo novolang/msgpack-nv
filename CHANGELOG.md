@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.3 — 2026-11-03
+
+This release requires novo 0.23.0 or later.
+
 ## 0.1.2 — 2026-10-25
 
 The tests now cover the error paths and the refusal arms that the coverage gate reports, and a region that cannot run carries a `cov: skip` marker with its reason.  No signature and no behaviour changed.
